@@ -1,0 +1,98 @@
+name: macos-adhoc-dmg
+
+# 小范围分发用的 ad-hoc 签名 + .dmg 打包流程。
+# 不在 ci/generate-workflows.py 管理范围内，避免与上游合并冲突。
+# 仅支持手动触发，按需使用。接收者首次运行需执行 `xattr -cr`，
+# 详见产物中的 INSTALL-MACOS.txt。
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: "Run cargo nextest before packaging"
+        required: false
+        default: "false"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      ADHOC_SIGN: "1"
+      BUILD_DMG: "1"
+
+    steps:
+      - name: "checkout repo"
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+
+      - name: "Install Rust (ARM)"
+        shell: bash
+        run: "rustup target add aarch64-apple-darwin"
+
+      - name: "Compile with sccache"
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: "Cache Rust Dependencies"
+        uses: actions/cache@v4
+        id: cache-cargo-vendor
+        with:
+          path: |
+            vendor
+            .cargo/config
+          key: "cargo-deps-adhoc-${{ hashFiles('**/Cargo.lock') }}"
+
+      - name: "Vendor dependencies"
+        if: steps.cache-cargo-vendor.outputs.cache-hit != 'true'
+        shell: bash
+        run: "cargo vendor --locked --versioned-dirs >> .cargo/config"
+
+      - name: "Install System Deps"
+        shell: bash
+        run: "env CI=yes PATH=$PATH ./get-deps"
+
+      - name: "Build wezterm (ARM)"
+        shell: bash
+        run: "cargo build --target aarch64-apple-darwin -p wezterm --release"
+
+      - name: "Build wezterm-gui (ARM)"
+        shell: bash
+        run: "cargo build --target aarch64-apple-darwin -p wezterm-gui --release"
+
+      - name: "Build wezterm-mux-server (ARM)"
+        shell: bash
+        run: "cargo build --target aarch64-apple-darwin -p wezterm-mux-server --release"
+
+      - name: "Build strip-ansi-escapes (ARM)"
+        shell: bash
+        run: "cargo build --target aarch64-apple-darwin -p strip-ansi-escapes --release"
+
+      - name: "Install cargo-nextest"
+        if: ${{ inputs.run_tests == 'true' }}
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: "cargo-nextest"
+          cache-key: "macos-adhoc"
+
+      - name: "Test"
+        if: ${{ inputs.run_tests == 'true' }}
+        shell: bash
+        run: "cargo nextest run --all --no-fail-fast --target=aarch64-apple-darwin"
+
+      - name: "Package (ad-hoc sign + dmg)"
+        shell: bash
+        run: "bash ci/deploy.sh"
+
+      - name: "Upload artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: "macos-adhoc-dmg"
+          path: |
+            WezTerm-*.dmg
+            WezTerm-*.zip
+            INSTALL-MACOS.txt
+          retention-days: 30

@@ -84,6 +84,11 @@ case $OSTYPE in
       security default-keychain -d user -s $def_keychain
       echo "Remove build.keychain"
       security delete-keychain build.keychain || true
+    elif [ -n "$ADHOC_SIGN" ] ; then
+      echo "Ad-hoc Codesign"
+      /usr/bin/codesign --force --options runtime \
+        --entitlements ci/macos-entitlement.plist \
+        --deep --sign - $zipdir/WezTerm.app/
     fi
 
     set -x
@@ -93,6 +98,35 @@ case $OSTYPE in
     if [ -n "$MACOS_TEAM_ID" ] ; then
       echo "Notarize"
       xcrun notarytool submit $zipname --wait --team-id "$MACOS_TEAM_ID" --apple-id "$MACOS_APPLEID" --password "$MACOS_APP_PW"
+    fi
+
+    if [ -n "$BUILD_DMG" ] ; then
+      dmgname="${zipname%.zip}.dmg"
+      rm -f "$dmgname"
+      dmg_staging=$(mktemp -d -t wezterm-dmg)
+      cp -R "$zipdir/WezTerm.app" "$dmg_staging/"
+      ln -s /Applications "$dmg_staging/Applications"
+      hdiutil create -volname "WezTerm" -srcfolder "$dmg_staging" \
+        -ov -format UDZO "$dmgname"
+      rm -rf "$dmg_staging"
+
+      cat > INSTALL-MACOS.txt <<'INSTALLEOF'
+WezTerm Ad-hoc Signed Build
+===========================
+
+This build is self-signed (ad-hoc) and NOT notarized by Apple.
+On first launch macOS Gatekeeper may say "WezTerm is damaged and
+can't be opened" because of the quarantine attribute applied to
+downloaded files.
+
+Install:
+  1. Open the .dmg and drag WezTerm.app into /Applications
+  2. Open Terminal.app (the system default) and run:
+         xattr -cr /Applications/WezTerm.app
+  3. Launch WezTerm from Spotlight or Finder as usual.
+
+This step is only needed the first time you install or upgrade.
+INSTALLEOF
     fi
     set -x
 
