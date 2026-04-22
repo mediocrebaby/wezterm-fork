@@ -221,10 +221,12 @@ impl crate::TermWindow {
                     bg_default = false;
                 }
 
-                (
-                    bg.mul_alpha(self.config.text_background_opacity),
-                    bg_default,
-                )
+                let bg_opacity = if is_tab_bar {
+                    1.0
+                } else {
+                    self.config.text_background_opacity
+                };
+                (bg.mul_alpha(bg_opacity), bg_default)
             };
 
             if !bg_is_default {
