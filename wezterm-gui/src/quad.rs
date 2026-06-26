@@ -105,6 +105,17 @@ pub trait QuadTrait {
 
     fn set_hsv(&mut self, hsv: Option<HsbTransform>);
     fn set_position(&mut self, left: f32, top: f32, right: f32, bottom: f32);
+
+    /// Position the four corners independently to draw an arbitrary (convex)
+    /// quadrilateral rather than an axis-aligned rectangle. Corners are given in
+    /// vertex-slot order: top-left, top-right, bottom-right, bottom-left.
+    fn set_position_quad(
+        &mut self,
+        top_left: (f32, f32),
+        top_right: (f32, f32),
+        bottom_right: (f32, f32),
+        bottom_left: (f32, f32),
+    );
 }
 
 pub enum QuadImpl<'a> {
@@ -113,6 +124,19 @@ pub enum QuadImpl<'a> {
 }
 
 impl<'a> QuadTrait for QuadImpl<'a> {
+    fn set_position_quad(
+        &mut self,
+        tl: (f32, f32),
+        tr: (f32, f32),
+        br: (f32, f32),
+        bl: (f32, f32),
+    ) {
+        match self {
+            Self::Vert(q) => q.set_position_quad(tl, tr, br, bl),
+            Self::Boxed(q) => q.set_position_quad(tl, tr, br, bl),
+        }
+    }
+
     fn set_texture_discrete(&mut self, x1: f32, x2: f32, y1: f32, y2: f32) {
         match self {
             Self::Vert(q) => q.set_texture_discrete(x1, x2, y1, y2),
@@ -162,6 +186,19 @@ pub struct Quad<'a> {
 }
 
 impl<'a> QuadTrait for Quad<'a> {
+    fn set_position_quad(
+        &mut self,
+        tl: (f32, f32),
+        tr: (f32, f32),
+        br: (f32, f32),
+        bl: (f32, f32),
+    ) {
+        self.vert[V_TOP_LEFT].position = [tl.0, tl.1];
+        self.vert[V_TOP_RIGHT].position = [tr.0, tr.1];
+        self.vert[V_BOT_RIGHT].position = [br.0, br.1];
+        self.vert[V_BOT_LEFT].position = [bl.0, bl.1];
+    }
+
     fn set_texture_discrete(&mut self, x1: f32, x2: f32, y1: f32, y2: f32) {
         self.vert[V_TOP_LEFT].tex = [x1, y1];
         self.vert[V_TOP_RIGHT].tex = [x2, y1];
@@ -234,6 +271,24 @@ pub struct BoxedQuad {
 }
 
 impl QuadTrait for BoxedQuad {
+    fn set_position_quad(
+        &mut self,
+        tl: (f32, f32),
+        tr: (f32, f32),
+        br: (f32, f32),
+        bl: (f32, f32),
+    ) {
+        // BoxedQuad can only store an axis-aligned rect, so fall back to the
+        // bounding box of the four corners. The cursor trail never goes through
+        // the heap allocator (it draws straight to the GPU buffer), so this
+        // path is only here for trait completeness.
+        let left = tl.0.min(tr.0).min(br.0).min(bl.0);
+        let right = tl.0.max(tr.0).max(br.0).max(bl.0);
+        let top = tl.1.min(tr.1).min(br.1).min(bl.1);
+        let bottom = tl.1.max(tr.1).max(br.1).max(bl.1);
+        self.position = (left, top, right, bottom);
+    }
+
     fn set_texture_discrete(&mut self, x1: f32, x2: f32, y1: f32, y2: f32) {
         self.tex = (x1, x2, y1, y2);
     }

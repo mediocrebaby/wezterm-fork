@@ -75,6 +75,7 @@ pub mod clipboard;
 pub mod keyevent;
 pub mod modal;
 mod mouseevent;
+mod cursor_spring;
 pub mod palette;
 pub mod paneselect;
 mod prevcursor;
@@ -84,7 +85,8 @@ mod selection;
 pub mod spawn;
 pub mod webgpu;
 use crate::spawn::SpawnWhere;
-use prevcursor::PrevCursorPos;
+use cursor_spring::CursorTrail;
+use prevcursor::{CursorSmearState, PrevCursorPos};
 
 const ATLAS_SIZE: usize = 128;
 
@@ -401,6 +403,13 @@ pub struct TermWindow {
     window_drag_position: Option<MouseEvent>,
     current_mouse_event: Option<MouseEvent>,
     prev_cursor: PrevCursorPos,
+    /// Tracks the cursor's previous on-screen pixel rect to detect movement and
+    /// suppress the trail on scroll.
+    cursor_smear_pos: RefCell<CursorSmearState>,
+    /// Neovide-style 4-corner spring animation state for the cursor trail.
+    cursor_trail: RefCell<CursorTrail>,
+    /// Timestamp of the previous cursor-trail frame, used to compute dt.
+    cursor_trail_last_frame: RefCell<Option<Instant>>,
     last_scroll_info: RenderableDimensions,
 
     tab_state: RefCell<HashMap<TabId, TabState>>,
@@ -719,6 +728,9 @@ impl TermWindow {
             current_mouse_event: None,
             current_modifier_and_leds: Default::default(),
             prev_cursor: PrevCursorPos::new(),
+            cursor_smear_pos: RefCell::new(CursorSmearState::new()),
+            cursor_trail: RefCell::new(CursorTrail::new()),
+            cursor_trail_last_frame: RefCell::new(None),
             last_scroll_info: RenderableDimensions::default(),
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),

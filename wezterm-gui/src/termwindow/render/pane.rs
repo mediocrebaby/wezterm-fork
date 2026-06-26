@@ -1,10 +1,13 @@
-use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator};
+use crate::quad::{
+    HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait,
+};
 use crate::selection::SelectionRange;
 use crate::termwindow::box_model::*;
 use crate::termwindow::render::{
     same_hyperlink, CursorProperties, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     RenderScreenLineParams,
 };
+use crate::termwindow::prevcursor::CursorPixelRect;
 use crate::termwindow::{ScrollHit, UIItem, UIItemType};
 use ::window::bitmaps::TextureRect;
 use ::window::DeadKeyStatus;
@@ -14,11 +17,22 @@ use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::PositionedPane;
 use ordered_float::NotNan;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use wezterm_dynamic::Value;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
+
+/// Inputs for the dedicated cursor trail pass, gathered from paint_pane.
+struct CursorSmearParams<'a> {
+    cursor: &'a StableCursorPosition,
+    viewport_top: StableRowIndex,
+    left_pixel_x: f32,
+    top_pixel_y: f32,
+    cell_width: f32,
+    cell_height: f32,
+    cursor_bg: LinearRgba,
+}
 
 impl crate::TermWindow {
     fn paint_pane_box_model(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
@@ -571,6 +585,33 @@ impl crate::TermWindow {
             }
         }
 
+        // Dedicated cursor pass: draw the (optionally smeared) cursor outside of
+        // the per-line quad cache so it can move continuously between cells.
+        // See ADR 0001. `render` (which borrowed self/layers) has been dropped
+        // with the block above, so self and layers are free again here.
+        if pos.is_active && self.config.cursor_smear_duration_ms != 0 {
+            let left_pixel_x = padding_left
+                + border.left.get() as f32
+                + (pos.left as f32 * cell_width);
+            let stable_range = match current_viewport {
+                Some(top) => top..top + dims.viewport_rows as StableRowIndex,
+                None => dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex,
+            };
+            self.paint_cursor_smear(
+                CursorSmearParams {
+                    cursor: &cursor,
+                    viewport_top: stable_range.start,
+                    left_pixel_x,
+                    top_pixel_y,
+                    cell_width,
+                    cell_height,
+                    cursor_bg,
+                },
+                layers,
+            )
+            .context("paint_cursor_smear")?;
+        }
+
         /*
         if let Some(zone) = zone {
             // TODO: render a thingy to jump to prior prompt
@@ -580,6 +621,110 @@ impl crate::TermWindow {
         log::trace!("lines elapsed {:?}", start.elapsed());
 
         Ok(())
+    }
+
+    /// Draw the cursor as a dedicated, non-cached quad so it can move
+    /// continuously between cells (the Neovide-style "trail" animation). The
+    /// cursor is four corners animated by independent critically damped springs;
+    /// the animated corners are drawn as a filled quadrilateral. See ADR 0001.
+    fn paint_cursor_smear(
+        &mut self,
+        params: CursorSmearParams,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        use termwiz::surface::CursorVisibility;
+
+        let target = self.cursor_target_rect(&params);
+
+        if params.cursor.visibility != CursorVisibility::Visible {
+            // Keep the trail snapped to the (hidden) position so it doesn't
+            // animate from a stale spot when the cursor reappears.
+            self.cursor_smear_pos
+                .borrow_mut()
+                .should_snap(params.viewport_top);
+            self.cursor_trail.borrow_mut().snap_to(target);
+            *self.cursor_trail_last_frame.borrow_mut() = None;
+            return Ok(());
+        }
+
+        // On the first frame or after a scroll, snap the trail rather than
+        // animating, so scrolling is not mistaken for cursor movement.
+        if self
+            .cursor_smear_pos
+            .borrow_mut()
+            .should_snap(params.viewport_top)
+        {
+            self.cursor_trail.borrow_mut().snap_to(target);
+        }
+
+        let dt = self.cursor_trail_dt();
+        let base_len = self.config.cursor_smear_duration_ms as f32 / 1000.0;
+        let trail_size = self.config.cursor_trail_size;
+
+        let animating = self
+            .cursor_trail
+            .borrow_mut()
+            .update(target, dt, base_len, trail_size);
+
+        if animating {
+            // Re-render next frame at the configured animation rate.
+            let fps = self.config.animation_fps.max(1) as u64;
+            let next = Instant::now() + Duration::from_millis(1000 / fps);
+            self.update_next_frame_time(Some(next));
+        } else {
+            *self.cursor_trail_last_frame.borrow_mut() = None;
+        }
+
+        let corners = self.cursor_trail.borrow().corner_points();
+        self.draw_cursor_quad(corners, params.cursor_bg, layers)
+    }
+
+    /// Seconds elapsed since the previous trail frame, clamped to avoid large
+    /// jumps after the animation was idle. Updates the stored timestamp.
+    fn cursor_trail_dt(&self) -> f32 {
+        let now = Instant::now();
+        let mut last = self.cursor_trail_last_frame.borrow_mut();
+        let dt = match *last {
+            Some(prev) => (now - prev).as_secs_f32().min(0.1),
+            None => 0.0,
+        };
+        *last = Some(now);
+        dt
+    }
+
+    /// Draw the four animated cursor corners as a filled quadrilateral. Corners
+    /// are in window pixels, perimeter order (TL, TR, BR, BL).
+    fn draw_cursor_quad(
+        &self,
+        corners: [(f32, f32); 4],
+        color: LinearRgba,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        let left_offset = self.dimensions.pixel_width as f32 / 2.;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.;
+        let gl = |c: (f32, f32)| (c.0 - left_offset, c.1 - top_offset);
+
+        let gl_state = self.render_state.as_ref().unwrap();
+        let filled_box = gl_state.util_sprites.filled_box.texture_coords();
+
+        let mut quad = layers.allocate(0).context("layers.allocate for cursor")?;
+        quad.set_position_quad(gl(corners[0]), gl(corners[1]), gl(corners[2]), gl(corners[3]));
+        quad.set_texture(filled_box);
+        quad.set_is_background();
+        quad.set_fg_color(color);
+        quad.set_hsv(None);
+        Ok(())
+    }
+
+    /// The cursor's current target rectangle in window-relative screen pixels.
+    fn cursor_target_rect(&self, params: &CursorSmearParams) -> CursorPixelRect {
+        let row_offset = params.cursor.y - params.viewport_top;
+        CursorPixelRect {
+            x: params.left_pixel_x + params.cursor.x as f32 * params.cell_width,
+            y: params.top_pixel_y + row_offset as f32 * params.cell_height,
+            width: params.cell_width,
+            height: params.cell_height,
+        }
     }
 
     pub fn build_pane(&mut self, pos: &PositionedPane) -> anyhow::Result<ComputedElement> {

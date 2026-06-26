@@ -350,7 +350,13 @@ impl crate::TermWindow {
                 + params.left_pixel_x
                 + (phys(params.cursor.x, num_cols, direction) as f32 * cell_width);
 
-            if let Some(shape) = cursor_shape {
+            // When the smear animation is enabled the cursor shape is drawn by a
+            // dedicated, non-cached pass in paint_pane (see ADR 0001) so that it
+            // can move continuously between cells. We still let compute_cell_fg_bg
+            // above reverse the cell colors under the cursor.
+            let smear_enabled = params.config.cursor_smear_duration_ms != 0;
+
+            if let Some(shape) = cursor_shape.filter(|_| !smear_enabled) {
                 let cursor_layer = match shape {
                     CursorShape::BlinkingBar | CursorShape::SteadyBar => 2,
                     _ => 0,

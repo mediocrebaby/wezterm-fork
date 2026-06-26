@@ -642,6 +642,16 @@ pub struct Config {
     #[dynamic(default = "linear_ease")]
     pub cursor_blink_ease_out: EasingFunction,
 
+    /// Duration in milliseconds of the cursor trail (smear) animation that
+    /// plays when the cursor moves. 0 disables the effect (the default).
+    #[dynamic(default)]
+    pub cursor_smear_duration_ms: u64,
+    /// How much the trailing corners of the cursor lag behind the leading ones
+    /// (0.0..=1.0). Higher values stretch the trail more. Mirrors Neovide's
+    /// `cursor_trail_size`.
+    #[dynamic(default = "default_cursor_trail_size")]
+    pub cursor_trail_size: f32,
+
     #[dynamic(default = "default_anim_fps")]
     pub animation_fps: u8,
 
@@ -1673,6 +1683,10 @@ fn default_ratelimit_line_prefetches_per_second() -> u32 {
 
 fn default_cursor_blink_rate() -> u64 {
     800
+}
+
+fn default_cursor_trail_size() -> f32 {
+    0.7
 }
 
 fn default_text_blink_rate() -> u64 {
