@@ -42,15 +42,15 @@ jobs:
         shell: bash
         run: "git config --global --add safe.directory /__w/wezterm/wezterm"
       - name: "checkout repo"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: "recursive"
       - name: "Install Rust"
         uses: dtolnay/rust-toolchain@stable
       - name: "Compile with sccache"
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: "Cache Rust Dependencies"
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         id: cache-cargo-vendor
         with:
           path: |
@@ -97,7 +97,7 @@ jobs:
         shell: bash
         run: "bash ci/appimage.sh"
       - name: "Upload artifact"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: "ubuntu20.04"
           path: |
@@ -120,9 +120,9 @@ jobs:
         shell: bash
         run: "git config --global --add safe.directory /__w/wezterm/wezterm"
       - name: "checkout repo"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: "Checkout linuxbrew tap"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: "wez/homebrew-wezterm-linuxbrew"
           path: "linuxbrew-wezterm"
@@ -136,7 +136,7 @@ jobs:
           commit_message: "Automated update to match latest tag"
           repository: "linuxbrew-wezterm"
       - name: "Download artifact"
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: "ubuntu20.04"
       - name: "Checksum"
@@ -153,7 +153,7 @@ jobs:
         shell: bash
         run: "bash ci/retry.sh gh release upload --clobber $(ci/tag-name.sh) wezterm-*.deb wezterm-*.xz *src.tar.gz *.AppImage *.sha256"
       - name: "Checkout flathub/org.wezfurlong.wezterm"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: "flathub/org.wezfurlong.wezterm"
           path: "flathub"
