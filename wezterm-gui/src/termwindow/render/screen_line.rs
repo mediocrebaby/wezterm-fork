@@ -350,13 +350,21 @@ impl crate::TermWindow {
                 + params.left_pixel_x
                 + (phys(params.cursor.x, num_cols, direction) as f32 * cell_width);
 
-            // When the smear animation is enabled the cursor shape is drawn by a
-            // dedicated, non-cached pass in paint_pane (see ADR 0001) so that it
-            // can move continuously between cells. We still let compute_cell_fg_bg
-            // above reverse the cell colors under the cursor.
-            let smear_enabled = params.config.cursor_smear_duration_ms != 0;
+            // When the smear animation is enabled the dedicated smear pass in
+            // paint_pane owns the entire cursor — shape, trail and resting colour
+            // (see ADR 0001) — so the per-line pass skips drawing the cursor and
+            // only lets compute_cell_fg_bg above reverse the cell colours under
+            // it. Exceptions are cursors with special, non-trailing semantics
+            // that the per-line pass renders specially: an active IME pre-edit
+            // (variable-width composition block) and password input (lock glyph).
+            // For those the smear stands down and the cursor is drawn here.
+            let composing =
+                matches!(self.dead_key_status, DeadKeyStatus::Composing(_)) || self.leader_is_active();
+            let smear_owns_cursor = params.config.cursor_smear_duration_ms != 0
+                && !composing
+                && !params.password_input;
 
-            if let Some(shape) = cursor_shape.filter(|_| !smear_enabled) {
+            if let Some(shape) = cursor_shape.filter(|_| !smear_owns_cursor) {
                 let cursor_layer = match shape {
                     CursorShape::BlinkingBar | CursorShape::SteadyBar => 2,
                     _ => 0,

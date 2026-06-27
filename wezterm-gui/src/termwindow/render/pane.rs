@@ -16,6 +16,7 @@ use config::VisualBellTarget;
 use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::PositionedPane;
+use termwiz::surface::CursorShape;
 use ordered_float::NotNan;
 use std::time::{Duration, Instant};
 use wezterm_dynamic::Value;
@@ -24,6 +25,10 @@ use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
 
 /// Inputs for the dedicated cursor trail pass, gathered from paint_pane.
+///
+/// The smear pass owns the entire cursor when enabled (see ADR 0001): it draws
+/// the cursor's shape (block/bar/underline) and its resting colour as well as
+/// the trail, so the trail is the cursor stretched rather than a separate block.
 struct CursorSmearParams<'a> {
     cursor: &'a StableCursorPosition,
     viewport_top: StableRowIndex,
@@ -31,7 +36,18 @@ struct CursorSmearParams<'a> {
     top_pixel_y: f32,
     cell_width: f32,
     cell_height: f32,
-    cursor_bg: LinearRgba,
+    /// Effective cursor shape (config default resolved against the cursor's own
+    /// shape) used to narrow the trail rect into a bar/underline.
+    shape: CursorShape,
+    /// True when the per-line pass renders a special cursor that the smear must
+    /// not take over: an active IME pre-edit (variable-width composition block)
+    /// or password input (lock glyph). The smear stands down and snaps without a
+    /// trail so it doesn't paint a second cursor over the special one.
+    defer_to_per_line: bool,
+    /// Resolved cursor colour for the *target* cell, matching what
+    /// compute_cell_fg_bg would pick for a plain (non-IME, non-selection)
+    /// cursor — including force_reverse_video_cursor. Used for the whole trail.
+    cursor_color: LinearRgba,
 }
 
 impl crate::TermWindow {
@@ -597,6 +613,50 @@ impl crate::TermWindow {
                 Some(top) => top..top + dims.viewport_rows as StableRowIndex,
                 None => dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex,
             };
+
+            // Effective shape: config default resolved against the cursor's own
+            // shape. This narrows the trail rect into a bar/underline.
+            let shape = config.default_cursor_style.effective_shape(cursor.shape);
+
+            // The per-line pass owns a special cursor here, so the smear stands
+            // down: an active IME pre-edit (composition block) or password input
+            // (lock glyph). Mirrors the same checks in render_line / screen_line.
+            let composing = matches!(self.dead_key_status, DeadKeyStatus::Composing(_))
+                || self.leader_is_active();
+            let password_input = self.config.detect_password_input
+                && match pos.pane.get_metadata() {
+                    Value::Object(obj) => matches!(
+                        obj.get(&Value::String("password_input".to_string())),
+                        Some(Value::Bool(true))
+                    ),
+                    _ => false,
+                };
+            let defer_to_per_line = composing || password_input;
+
+            // Resolve the cursor colour for the target cell, matching the plain
+            // cursor branch of compute_cell_fg_bg (incl. reverse-video). Read the
+            // target cell's fg/bg for the contrast test the reverse path needs.
+            let (cell_fg, cell_bg) = {
+                let row = cursor.y;
+                let (_first, lines) = pos.pane.get_lines(row..row + 1);
+                let attrs = lines
+                    .first()
+                    .and_then(|line| line.get_cell(cursor.x).map(|c| c.attrs().clone()));
+                match attrs {
+                    Some(attrs) => (
+                        palette.resolve_fg(attrs.foreground()).to_linear(),
+                        palette.resolve_bg(attrs.background()).to_linear(),
+                    ),
+                    None => (foreground, default_bg),
+                }
+            };
+            let cursor_color = self.resolve_cursor_smear_color(
+                cursor_is_default_color,
+                cursor_bg,
+                cell_fg,
+                cell_bg,
+            );
+
             self.paint_cursor_smear(
                 CursorSmearParams {
                     cursor: &cursor,
@@ -605,7 +665,9 @@ impl crate::TermWindow {
                     top_pixel_y,
                     cell_width,
                     cell_height,
-                    cursor_bg,
+                    shape,
+                    defer_to_per_line,
+                    cursor_color,
                 },
                 layers,
             )
@@ -623,10 +685,39 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// Resolve the colour the smear should paint the cursor in, mirroring the
+    /// plain-cursor branch of `compute_cell_fg_bg` (no IME / selection / bell,
+    /// which the smear never owns). For every shape the cursor colour reduces to
+    /// the same choice: reverse-video uses the target cell's foreground, and
+    /// otherwise the palette `cursor_bg`. `cell_fg`/`cell_bg` are the target
+    /// cell's resolved colours, needed for the force_reverse_video_cursor
+    /// contrast test. See ADR 0001.
+    fn resolve_cursor_smear_color(
+        &self,
+        cursor_is_default_color: bool,
+        cursor_bg: LinearRgba,
+        cell_fg: LinearRgba,
+        cell_bg: LinearRgba,
+    ) -> LinearRgba {
+        let reverse = self.config.force_reverse_video_cursor
+            && cursor_is_default_color
+            && cell_fg.contrast_ratio(&cell_bg)
+                >= self.config.reverse_video_cursor_min_contrast;
+        if reverse {
+            cell_fg
+        } else {
+            cursor_bg
+        }
+    }
+
     /// Draw the cursor as a dedicated, non-cached quad so it can move
-    /// continuously between cells (the Neovide-style "trail" animation). The
-    /// cursor is four corners animated by independent critically damped springs;
-    /// the animated corners are drawn as a filled quadrilateral. See ADR 0001.
+    /// continuously between cells (the Neovide-style "trail" animation). When
+    /// the smear is enabled this pass owns the *entire* cursor: it draws the
+    /// shape (block/bar/underline narrowed by `cursor_target_rect`) in the
+    /// resolved cursor colour, both moving and at rest, so the trail is the
+    /// cursor stretched rather than a detached block. The four corners are
+    /// animated by independent critically damped springs and drawn as a filled
+    /// quadrilateral. See ADR 0001.
     fn paint_cursor_smear(
         &mut self,
         params: CursorSmearParams,
@@ -636,9 +727,12 @@ impl crate::TermWindow {
 
         let target = self.cursor_target_rect(&params);
 
-        if params.cursor.visibility != CursorVisibility::Visible {
-            // Keep the trail snapped to the (hidden) position so it doesn't
-            // animate from a stale spot when the cursor reappears.
+        // While the per-line pass owns a special cursor (IME composition block or
+        // password lock glyph), stand down so we don't paint a second cursor over
+        // it, and snap the trail to the current spot so that interlude isn't
+        // mistaken for movement once we resume.
+        let hidden = params.cursor.visibility != CursorVisibility::Visible;
+        if hidden || params.defer_to_per_line {
             self.cursor_smear_pos
                 .borrow_mut()
                 .should_snap(params.viewport_top);
@@ -675,8 +769,11 @@ impl crate::TermWindow {
             *self.cursor_trail_last_frame.borrow_mut() = None;
         }
 
+        // Always draw: this pass owns the cursor, so even at rest the (settled)
+        // quad is the cursor's resting shape. No hand-off to the per-line pass,
+        // hence no block->bar popping.
         let corners = self.cursor_trail.borrow().corner_points();
-        self.draw_cursor_quad(corners, params.cursor_bg, layers)
+        self.draw_cursor_quad(corners, params.cursor_color, layers)
     }
 
     /// Seconds elapsed since the previous trail frame, clamped to avoid large
@@ -716,14 +813,41 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    /// The cursor's current target rectangle in window-relative screen pixels.
+    /// The cursor's current target rectangle in window-relative screen pixels,
+    /// narrowed to the cursor shape. Block fills the cell; Bar is a thin column
+    /// on the left edge; Underline is a thin row on the bottom edge. The trail
+    /// springs act on this rect, so the trail is the shape stretched (a bar
+    /// trails as a bar, not as a block). See ADR 0001.
     fn cursor_target_rect(&self, params: &CursorSmearParams) -> CursorPixelRect {
         let row_offset = params.cursor.y - params.viewport_top;
-        CursorPixelRect {
-            x: params.left_pixel_x + params.cursor.x as f32 * params.cell_width,
-            y: params.top_pixel_y + row_offset as f32 * params.cell_height,
-            width: params.cell_width,
-            height: params.cell_height,
+        let cell_x = params.left_pixel_x + params.cursor.x as f32 * params.cell_width;
+        let cell_y = params.top_pixel_y + row_offset as f32 * params.cell_height;
+
+        // Thickness of bar/underline, scaled to the configured cursor sprite
+        // weight so the resting shape roughly matches the per-line cursor. At
+        // least one pixel so it never vanishes.
+        let thickness = (self.render_metrics.underline_height as f32).max(1.0);
+
+        match params.shape {
+            CursorShape::BlinkingBar | CursorShape::SteadyBar => CursorPixelRect {
+                x: cell_x,
+                y: cell_y,
+                width: thickness,
+                height: params.cell_height,
+            },
+            CursorShape::BlinkingUnderline | CursorShape::SteadyUnderline => CursorPixelRect {
+                x: cell_x,
+                y: cell_y + params.cell_height - thickness,
+                width: params.cell_width,
+                height: thickness,
+            },
+            // Block (and Default) fill the whole cell.
+            _ => CursorPixelRect {
+                x: cell_x,
+                y: cell_y,
+                width: params.cell_width,
+                height: params.cell_height,
+            },
         }
     }
 

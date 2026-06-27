@@ -94,8 +94,30 @@ Ghostty 原生用 GPU fragment shader + SDF（距离场）逐像素判定拖尾�
 
 弹簧的滚动/可见性处理沿用决策 #4：滚动或光标隐藏时 `CursorTrail::snap_to`（无动画瞬移）。
 
+### 第四阶段（已被第五阶段取代）：静止时恢复光标形状（bar/underline）
+
+> 注：本阶段的"移动画块、静止交还逐行"分工虽解决了静止形状，但实机验证发现两个问题——(1) 移动到位时有可见的 **block→bar 形变跳变**；(2) 反色等光标配色**未体现在拖尾上**。根因是"拖尾"与"光标头部"由两套机制分别绘制，存在交接，观感割裂。故被第五阶段整体取代。以下保留作演进记录。
+
+第三阶段遗留问题：smear 启用后，`render_screen_line` 用 `!smear_enabled` **无条件**跳过逐行光标 quad，光标形状唯一来源变成只会画实心块（`draw_cursor_quad` 硬编码 `filled_box` + `cursor_bg`）的 smear pass。后果是设成 SteadyBar/SteadyUnderline 时，**移动中和静止时都显示成块**。
+
+采用的方案——**移动中由 smear pass 画块状拖尾虚影，静止后把光标交还逐行路径按形状绘制**（"拖尾是虚影、头部尊重形状"）：
+
+- **分工**：逐行路径（`render_screen_line` → `compute_cell_fg_bg` → `cursor_sprite`）已正确处理 bar/underline 形状、反色、`cursor_border_color` 配色、密码锁、IME 合成、未聚焦时 bar→block 等全部既有语义；静止态直接复用，**不在 smear pass 里重新实现形状与配色**（故"完整配色支持"亦随之解决）。
+- **时序难点**：逐行渲染先于 `paint_cursor_smear` 执行，需要"是否仍在动画"时本帧 `update()` 尚未运行。解决：新增跨帧状态 `TermWindow::cursor_trail_animating`（`Cell<bool>`），逐行路径读**上一帧**的值决定是否让出光标（`smear_owns_cursor = smear 启用 && 上一帧在动画`）；smear pass 在末尾写入本帧值。代价是静止后延迟一帧才显形状（≈ 一帧，肉眼不可见），且 smear pass 的 `update_next_frame_time` 保证该帧确实被重绘。
+- **缓存失效**：`LineQuadCacheKey` 新增 `cursor_smear_animating: bool`，使动画↔静止切换时光标行缓存失效、强制重画，否则静止帧命中旧的"无光标"缓存。
+- **临界帧无空窗**：静止那一帧逐行仍按"上一帧在动画"让出了光标，故 smear pass 在 `was_animating && !animating` 时仍画一次块（此时块已收缩贴合目标格，与下一帧的 bar/underline 衔接）；光标隐藏分支同步把 `cursor_trail_animating` 置 `false`，避免重现时形状被持续抑制。
+
+### 第五阶段（已实现）：smear pass 独占光标——拖尾即形状的拉伸
+
+针对第四阶段的"割裂"反馈，确立新原则：**smear 启用时，光标（形状 + 拖尾 + 静止态 + 配色）完全、始终由 smear pass 一处绘制，逐行路径恒不画普通光标**（仅保留 cell 反色）。无交接 → 无 block→bar 跳变；拖尾本身就是光标形状的拉伸 → 浑然一体。
+
+- **形状即几何**：不在 `CursorTrail` 里引入"形状"概念，而由 `cursor_target_rect` 按形状直接返回**缩窄的目标矩形**——bar = 贴左边、宽 `underline_height` 量级的细列；underline = 贴底边的扁行；block = 整格。4 角弹簧照常作用于这个窄 rect，于是 bar 的拖尾是细竖条的拉伸、underline 是扁条的拉伸。`cursor_spring.rs` 零改动。
+- **配色统一**：拖尾全程用**目标 cell** 的光标色（移动跨多格也不逐格变色，符合 Neovide 观感）。新增 helper `resolve_cursor_smear_color`，复刻 `compute_cell_fg_bg` 的普通光标分支——归结为「反色 ? 目标 cell 前景色 : `cursor_bg`」（与形状无关）；反色判定沿用 `force_reverse_video_cursor` + `cursor_is_default_color` + 对比度。所需的目标 cell fg/bg 在 `paint_pane` 末尾用一次 `get_lines(row..row+1)` 读取。
+- **特殊光标礼让**：IME 预编辑（composition 变宽块）与密码输入（lock glyph）由逐行路径承载专属 glyph，语义上不该有拖尾。smear pass 检测到 `defer_to_per_line`（composing/leader 或 password_input）即 `snap_to` 当前位并**当帧不画**；逐行路径的 `smear_owns_cursor` 对称地排除这两种情形，照常画块/锁。退出后回归 smear 独占。
+- **回退第四阶段脚手架**：移除跨帧状态 `cursor_trail_animating` 与缓存键 `cursor_smear_animating`——A 方案光标全程归 smear、逐行恒不画，不再需要跨帧交接与缓存翻转。
+- `CursorSmearParams` 扩展 `shape` / `defer_to_per_line` / `cursor_color`；`draw_cursor_quad` 改用传入的 `cursor_color`。
+
 ### 待办
 
-- 光标形状（bar/underline）与完整配色支持（当前 trail 只画块状、用 `cursor_bg`）。
-- 实机调参：`cursor_trail_size`、`cursor_smear_duration_ms`、角排名映射曲线。
-- **运行期视觉验证**：已编译通过；4 角弹簧拖尾的观感、跨行/对角移动表现需在真实窗口确认。
+- 实机调参：`cursor_trail_size`、`cursor_smear_duration_ms`、角排名映射曲线；以及 bar/underline 的 `thickness`（现取 `underline_height`，与原生描边 bar 粗细可能略有差异）。
+- **运行期视觉验证**：已编译通过；需在真实窗口确认——(1) SteadyBar/SteadyUnderline 静止时是细条形状、移动时拖尾也是该形状的拉伸且**无 block→bar 跳变**；(2) `force_reverse_video_cursor` 下反色已体现在拖尾上；(3) 中文拼音输入（IME 预编辑）与密码输入时光标正常（变宽块 / 锁形），无双重光标、无残留拖尾。
