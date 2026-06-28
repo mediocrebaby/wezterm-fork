@@ -1,21 +1,11 @@
 name: windows
 
+# Windows 构建打包流程。
+# 已脱离 ci/generate-workflows.py，改为手动维护（该脚本已删除）。
+# 仅支持手动触发，按需出包。
+
 on:
   workflow_dispatch:
-  pull_request:
-    branches:
-      - main
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.lock"
-      - "**/Cargo.toml"
-      - ".cargo/config.toml"
-      - ".github/workflows/gen_windows.yml"
-      - "assets/fonts/**/*"
-      - "assets/icon/*"
-      - "assets/windows/**/*"
-      - "ci/deploy.sh"
-      - "ci/windows-installer.iss"
 
 jobs:
   build:

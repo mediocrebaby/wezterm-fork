@@ -1,5 +1,9 @@
 name: ubuntu22.04
 
+# Ubuntu 22.04 构建打包流程。
+# 已脱离 ci/generate-workflows.py，改为手动维护（该脚本已删除）。
+# 仅支持手动触发，按需出包。
+
 on:
   workflow_dispatch:
 
