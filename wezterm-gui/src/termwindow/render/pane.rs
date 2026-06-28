@@ -32,6 +32,12 @@ use window::color::LinearRgba;
 struct CursorSmearParams<'a> {
     cursor: &'a StableCursorPosition,
     viewport_top: StableRowIndex,
+    /// Window-absolute pixel coordinates of this pane's origin (top-left corner),
+    /// i.e. already offset by the pane's position within the window (pos.left /
+    /// pos.top). `cursor_target_rect` adds only the in-pane cell offset on top, so
+    /// both axes must carry the pane offset here symmetrically — otherwise a pane
+    /// that is not at the window origin (e.g. the lower pane of a horizontal
+    /// split) draws its cursor at the wrong place.
     left_pixel_x: f32,
     top_pixel_y: f32,
     cell_width: f32,
@@ -606,9 +612,15 @@ impl crate::TermWindow {
         // See ADR 0001. `render` (which borrowed self/layers) has been dropped
         // with the block above, so self and layers are free again here.
         if pos.is_active && self.config.cursor_smear_duration_ms != 0 {
+            // Pane-origin absolute pixel coordinates. left_pixel_x already folds
+            // in the pane's horizontal offset (pos.left); top_pixel_y here is only
+            // the window content-area top, so add the pane's vertical offset
+            // (pos.top) to match. Both axes now carry the pane offset, so
+            // cursor_target_rect only has to add the in-pane cell offset.
             let left_pixel_x = padding_left
                 + border.left.get() as f32
                 + (pos.left as f32 * cell_width);
+            let pane_top_pixel_y = top_pixel_y + (pos.top as f32 * cell_height);
             let stable_range = match current_viewport {
                 Some(top) => top..top + dims.viewport_rows as StableRowIndex,
                 None => dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex,
@@ -662,7 +674,7 @@ impl crate::TermWindow {
                     cursor: &cursor,
                     viewport_top: stable_range.start,
                     left_pixel_x,
-                    top_pixel_y,
+                    top_pixel_y: pane_top_pixel_y,
                     cell_width,
                     cell_height,
                     shape,
