@@ -117,7 +117,18 @@ Ghostty 原生用 GPU fragment shader + SDF（距离场）逐像素判定拖尾�
 - **回退第四阶段脚手架**：移除跨帧状态 `cursor_trail_animating` 与缓存键 `cursor_smear_animating`——A 方案光标全程归 smear、逐行恒不画，不再需要跨帧交接与缓存翻转。
 - `CursorSmearParams` 扩展 `shape` / `defer_to_per_line` / `cursor_color`；`draw_cursor_quad` 改用传入的 `cursor_color`。
 
+### 第六阶段（已实现）：宽字符（CJK）光标宽度
+
+第五阶段「smear 独占光标」遗漏了一个场景：`cursor_target_rect` 把 Block/Underline 的矩形宽度硬编码为单个 `cell_width`，但宽字符（中文等 double-width 字形）占 **2 格**。后果是光标停在中文上时拖尾只覆盖**左半格**（「只映照一半」），英文（单格宽）正常。Bar 不受影响（贴左边缘的细竖条，宽度是 `thickness`，与字形宽度无关）。
+
+根因是 smear pass 未对齐逐行路径早已确立的宽字符语义——逐行 `render_screen_line` 的 `cursor_range` 用 `cursor_cell.width()`（宽字符=2、窄字符=1）算光标列跨度，smear pass 缺了这一步。本阶段是把 smear 对齐到该既有语义的**遗漏场景修补**，非新决策（故不另立 ADR）。
+
+- **取宽度**：复用 `paint_pane` 末尾**已有的那次** `get_lines(row..row+1)`（原本只为解析光标配色读目标 cell），顺带取 `cell.width()`，`None`（光标落在行尾外的空白等）回退 1 格——与逐行 `unwrap_or(1)` 一致。零额外 IO，宽度与配色源自同一个 cell，天然一致。`cursor_target_rect` 保持纯函数（只依赖 `params`）。
+- **加宽**：经 `CursorSmearParams.cell_cols: usize` 传入；`cursor_target_rect` 的 Block/Underline 宽度改为 `cell_width * cell_cols`，Bar 不变。4 角弹簧照常作用于这个加宽的 rect，中英文间移动时宽度在 1↔2 格间平滑过渡（retarget 保留角的当前位作为新残差，故连续）。
+- **右半格无需特判**：wezterm 的 cursor model 把 `cursor.x` 定在宽字符**起始列**；`visible_cells()` 用 `skip_width` 跳过被占据的后续物理 slot，故 `get_cell(cursor.x)` 在起始列返回 `width()==2`、在被跳过的右半列返回 `None`（回退 1）。与逐行路径同样不需要右半格分支。
+- **IME 不冲突**：逐行 `cursor_range` 的 `composition_width` 分支由 IME 预编辑触发，而此时 smear `defer_to_per_line` 已礼让、不会执行到 `cursor_target_rect`，故 smear 只需复刻 `cell.width()` 那一支。
+
 ### 待办
 
 - 实机调参：`cursor_trail_size`、`cursor_smear_duration_ms`、角排名映射曲线；以及 bar/underline 的 `thickness`（现取 `underline_height`，与原生描边 bar 粗细可能略有差异）。
-- **运行期视觉验证**：已编译通过；需在真实窗口确认——(1) SteadyBar/SteadyUnderline 静止时是细条形状、移动时拖尾也是该形状的拉伸且**无 block→bar 跳变**；(2) `force_reverse_video_cursor` 下反色已体现在拖尾上；(3) 中文拼音输入（IME 预编辑）与密码输入时光标正常（变宽块 / 锁形），无双重光标、无残留拖尾。
+- **运行期视觉验证**：已编译通过；需在真实窗口确认——(1) SteadyBar/SteadyUnderline 静止时是细条形状、移动时拖尾也是该形状的拉伸且**无 block→bar 跳变**；(2) `force_reverse_video_cursor` 下反色已体现在拖尾上；(3) 中文拼音输入（IME 预编辑）与密码输入时光标正常（变宽块 / 锁形），无双重光标、无残留拖尾；(4) **Neovim Normal 模式下光标停在中文上 block 完整覆盖 2 格**（不再只盖半格）、停在英文上仍是 1 格、中英文间移动时拖尾宽度平滑过渡；`SteadyUnderline` 停在中文上下划线为 2 格长。

@@ -45,6 +45,11 @@ struct CursorSmearParams<'a> {
     /// Effective cursor shape (config default resolved against the cursor's own
     /// shape) used to narrow the trail rect into a bar/underline.
     shape: CursorShape,
+    /// Column span of the cell under the cursor: 2 for a double-width (e.g. CJK)
+    /// glyph, else 1. Block/Underline widen the trail rect by this so the cursor
+    /// covers the whole wide glyph, matching the per-line cursor_range. Bar is a
+    /// thin column on the left edge and stays a single thickness regardless.
+    cell_cols: usize,
     /// True when the per-line pass renders a special cursor that the smear must
     /// not take over: an active IME pre-edit (variable-width composition block)
     /// or password input (lock glyph). The smear stands down and snaps without a
@@ -647,19 +652,21 @@ impl crate::TermWindow {
 
             // Resolve the cursor colour for the target cell, matching the plain
             // cursor branch of compute_cell_fg_bg (incl. reverse-video). Read the
-            // target cell's fg/bg for the contrast test the reverse path needs.
-            let (cell_fg, cell_bg) = {
+            // target cell's fg/bg for the contrast test the reverse path needs,
+            // and its column span so the trail can widen over double-width (CJK)
+            // glyphs the same way the per-line cursor_range does.
+            let (cell_fg, cell_bg, cell_cols) = {
                 let row = cursor.y;
                 let (_first, lines) = pos.pane.get_lines(row..row + 1);
-                let attrs = lines
-                    .first()
-                    .and_then(|line| line.get_cell(cursor.x).map(|c| c.attrs().clone()));
-                match attrs {
+                let cell = lines.first().and_then(|line| line.get_cell(cursor.x));
+                let cell_cols = cell.as_ref().map(|c| c.width()).unwrap_or(1);
+                match cell.map(|c| c.attrs().clone()) {
                     Some(attrs) => (
                         palette.resolve_fg(attrs.foreground()).to_linear(),
                         palette.resolve_bg(attrs.background()).to_linear(),
+                        cell_cols,
                     ),
-                    None => (foreground, default_bg),
+                    None => (foreground, default_bg, cell_cols),
                 }
             };
             let cursor_color = self.resolve_cursor_smear_color(
@@ -678,6 +685,7 @@ impl crate::TermWindow {
                     cell_width,
                     cell_height,
                     shape,
+                    cell_cols,
                     defer_to_per_line,
                     cursor_color,
                 },
@@ -840,6 +848,12 @@ impl crate::TermWindow {
         // least one pixel so it never vanishes.
         let thickness = (self.render_metrics.underline_height as f32).max(1.0);
 
+        // Visual width of the glyph under the cursor: a double-width (CJK) cell
+        // spans two columns, so Block/Underline must cover both — otherwise the
+        // trail only paints the left half over a wide glyph. Bar is a thin column
+        // pinned to the left edge and stays one thickness regardless of span.
+        let glyph_width = params.cell_width * params.cell_cols as f32;
+
         match params.shape {
             CursorShape::BlinkingBar | CursorShape::SteadyBar => CursorPixelRect {
                 x: cell_x,
@@ -850,14 +864,14 @@ impl crate::TermWindow {
             CursorShape::BlinkingUnderline | CursorShape::SteadyUnderline => CursorPixelRect {
                 x: cell_x,
                 y: cell_y + params.cell_height - thickness,
-                width: params.cell_width,
+                width: glyph_width,
                 height: thickness,
             },
             // Block (and Default) fill the whole cell.
             _ => CursorPixelRect {
                 x: cell_x,
                 y: cell_y,
-                width: params.cell_width,
+                width: glyph_width,
                 height: params.cell_height,
             },
         }
