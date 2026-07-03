@@ -194,4 +194,15 @@ impl CursorTrail {
         }
         self.target = Some(rect);
     }
+
+    /// Drop any remembered target and in-flight spring state. The next use will
+    /// start from a clean slate rather than resuming an old trail.
+    pub fn reset(&mut self) {
+        for corner in &mut self.corners {
+            corner.spring_x = Spring::default();
+            corner.spring_y = Spring::default();
+            corner.animation_length = 0.0;
+        }
+        self.target = None;
+    }
 }

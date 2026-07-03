@@ -360,7 +360,8 @@ impl crate::TermWindow {
             // For those the smear stands down and the cursor is drawn here.
             let composing =
                 matches!(self.dead_key_status, DeadKeyStatus::Composing(_)) || self.leader_is_active();
-            let smear_owns_cursor = params.config.cursor_smear_duration_ms != 0
+            let smear_owns_cursor = self.focused.is_some()
+                && params.config.cursor_smear_duration_ms != 0
                 && !composing
                 && !params.password_input;
 

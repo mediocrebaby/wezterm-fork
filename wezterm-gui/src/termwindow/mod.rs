@@ -542,6 +542,9 @@ impl TermWindow {
             self.current_mouse_buttons.clear();
             self.current_mouse_capture = None;
             self.is_click_to_focus_window = false;
+            self.cursor_smear_pos.borrow_mut().reset();
+            self.cursor_trail.borrow_mut().reset();
+            *self.cursor_trail_last_frame.borrow_mut() = None;
 
             for state in self.pane_state.borrow_mut().values_mut() {
                 state.mouse_terminal_coords.take();

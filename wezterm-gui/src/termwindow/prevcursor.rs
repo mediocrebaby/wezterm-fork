@@ -72,4 +72,8 @@ impl CursorSmearState {
         self.prev_viewport_top = Some(viewport_top);
         snap
     }
+
+    pub fn reset(&mut self) {
+        self.prev_viewport_top = None;
+    }
 }

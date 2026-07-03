@@ -616,7 +616,7 @@ impl crate::TermWindow {
         // the per-line quad cache so it can move continuously between cells.
         // See ADR 0001. `render` (which borrowed self/layers) has been dropped
         // with the block above, so self and layers are free again here.
-        if pos.is_active && self.config.cursor_smear_duration_ms != 0 {
+        if pos.is_active && self.config.cursor_smear_duration_ms != 0 && self.focused.is_some() {
             // Pane-origin absolute pixel coordinates. left_pixel_x already folds
             // in the pane's horizontal offset (pos.left); top_pixel_y here is only
             // the window content-area top, so add the pane's vertical offset
