@@ -166,6 +166,20 @@ impl Terminal {
         {
             let bytes = bytes.as_ref();
 
+            // 调试工具（resize-verify 框架）：设置 WEZTERM_RAW_DUMP=<path>
+            // 时把送入解析器的原始字节追加落盘，用于还原 ConPTY/子进程
+            // 实际发送的序列。
+            if let Ok(path) = std::env::var("WEZTERM_RAW_DUMP") {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = f.write_all(bytes);
+                }
+            }
+
             let mut performer = Performer::new(&mut self.state);
 
             self.parser.parse(bytes, |action| performer.perform(action));

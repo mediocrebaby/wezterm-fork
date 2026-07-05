@@ -5,6 +5,7 @@ members = [
   "strip-ansi-escapes",
   "sync-color-schemes",
   "deps/cairo",
+  "resize-verify/probe",
   "wezterm",
   "wezterm-blob-leases",
   "wezterm-cell",

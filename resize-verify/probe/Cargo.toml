@@ -1,0 +1,14 @@
+[package]
+name = "resize-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Resize 校验框架 L2：真实 ConPTY x wezterm-term 模型联动探针"
+
+[dependencies]
+anyhow.workspace = true
+portable-pty.workspace = true
+wezterm-term.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winapi = { workspace = true, features = ["consoleapi", "wincon"] }

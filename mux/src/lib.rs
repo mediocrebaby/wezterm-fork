@@ -329,6 +329,18 @@ fn read_from_pane_pty(
             Ok(size) => {
                 histogram!("read_from_pane_pty.bytes.rate").record(size as f64);
                 log::trace!("read_pty pane {pane_id} read {size} bytes");
+                // 调试工具（resize-verify 框架）：WEZTERM_RAW_DUMP=<path>
+                // 时把 pty 原始字节追加落盘（每 pane 一个文件）
+                if let Ok(path) = std::env::var("WEZTERM_RAW_DUMP") {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("{path}.pane{pane_id}"))
+                    {
+                        let _ = f.write_all(&buf[..size]);
+                    }
+                }
                 if let Err(err) = tx.write_all(&buf[..size]) {
                     error!(
                         "read_pty failed to write to parser: pane {} {:?}",
