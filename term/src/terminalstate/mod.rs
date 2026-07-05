@@ -189,19 +189,6 @@ impl ScreenOrAlt {
         }
     }
 
-    pub fn resize(
-        &mut self,
-        size: TerminalSize,
-        cursor_main: CursorPosition,
-        cursor_alt: CursorPosition,
-        seqno: SequenceNo,
-        is_conpty: bool,
-    ) -> (CursorPosition, CursorPosition) {
-        let cursor_main = self.screen.resize(size, cursor_main, seqno, is_conpty);
-        let cursor_alt = self.alt_screen.resize(size, cursor_alt, seqno, is_conpty);
-        (cursor_main, cursor_alt)
-    }
-
     pub fn activate_alt_screen(&mut self, seqno: SequenceNo) {
         self.alt_screen_is_active = true;
         self.dirty_top_phys_rows(seqno);
@@ -873,13 +860,25 @@ impl TerminalState {
             )
         };
 
-        let (adjusted_cursor_main, adjusted_cursor_alt) = self.screen.resize(
-            size,
-            cursor_main,
-            cursor_alt,
-            self.seqno,
-            self.enable_conpty_quirks,
-        );
+        // ConPTY：conhost 在 alt screen 激活期间不对非活动的主缓冲做
+        // reflow（实证：alt 期间窄→宽回环后，conhost 发的 CUP 仍基于
+        // 进入 alt 前的主缓冲布局）。若这里每跳都 reflow 主屏，「缩窄
+        // 溢出进 scrollback → 放宽拼回」的回环有损（总行数回不到原值），
+        // 视口顶偏离 conhost 缓冲顶，退出 alt 后输入回显整体错行。
+        // 因此主屏冻结，等切回主屏时一次性同步（见
+        // catch_up_primary_screen_size）。
+        let freeze_primary = self.screen.alt_screen_is_active && self.enable_conpty_quirks;
+        let adjusted_cursor_main = if freeze_primary {
+            cursor_main
+        } else {
+            self.screen
+                .screen
+                .resize(size, cursor_main, self.seqno, self.enable_conpty_quirks)
+        };
+        let adjusted_cursor_alt =
+            self.screen
+                .alt_screen
+                .resize(size, cursor_alt, self.seqno, self.enable_conpty_quirks);
         self.top_and_bottom_margins = 0..size.rows as i64;
         self.left_and_right_margins = 0..size.cols;
         self.pixel_height = size.pixel_height;
@@ -910,6 +909,46 @@ impl TerminalState {
                 saved.position.seqno = self.seqno;
                 saved.wrap_next = false;
             }
+        }
+    }
+
+    /// ConPTY：主屏在 alt screen 激活期间被冻结（见 resize），切回主屏
+    /// 前把它一次性 reflow 到当前尺寸 —— 与 conhost 在此刻对主缓冲做的
+    /// 那一次 ResizeWithReflow 对齐（单跳 reflow 是 L1/L2 验证过的对齐
+    /// 路径；多跳回环则有损，这正是冻结的理由）。
+    fn catch_up_primary_screen_size(&mut self) {
+        if !self.enable_conpty_quirks {
+            return;
+        }
+        let rows = self.screen.alt_screen.physical_rows;
+        let cols = self.screen.alt_screen.physical_cols;
+        let dpi = self.screen.alt_screen.dpi;
+        if self.screen.screen.physical_rows == rows && self.screen.screen.physical_cols == cols {
+            return;
+        }
+        let size = TerminalSize {
+            rows,
+            cols,
+            pixel_width: self.pixel_width,
+            pixel_height: self.pixel_height,
+            dpi,
+        };
+        let cursor_main = self
+            .screen
+            .screen
+            .saved_cursor
+            .as_ref()
+            .map(|s| s.position)
+            .unwrap_or_else(CursorPosition::default);
+        let adjusted = self
+            .screen
+            .screen
+            .resize(size, cursor_main, self.seqno, true);
+        if let Some(saved) = self.screen.screen.saved_cursor.as_mut() {
+            saved.position.x = adjusted.x;
+            saved.position.y = adjusted.y;
+            saved.position.seqno = self.seqno;
+            saved.wrap_next = false;
         }
     }
 
@@ -1687,6 +1726,7 @@ impl TerminalState {
                 if self.screen.is_alt_screen_active() {
                     self.pen = CellAttributes::default();
                     self.erase_in_display(EraseInDisplay::EraseDisplay);
+                    self.catch_up_primary_screen_size();
                     self.screen.activate_primary_screen(self.seqno);
                 }
             }
@@ -1695,6 +1735,7 @@ impl TerminalState {
                 DecPrivateModeCode::EnableAlternateScreen,
             )) => {
                 if self.screen.is_alt_screen_active() {
+                    self.catch_up_primary_screen_size();
                     self.screen.activate_primary_screen(self.seqno);
                     self.pen = CellAttributes::default();
                 }
@@ -1902,6 +1943,7 @@ impl TerminalState {
                 DecPrivateModeCode::ClearAndEnableAlternateScreen,
             )) => {
                 if self.screen.is_alt_screen_active() {
+                    self.catch_up_primary_screen_size();
                     self.screen.activate_primary_screen(self.seqno);
                     self.dec_restore_cursor();
                 }
