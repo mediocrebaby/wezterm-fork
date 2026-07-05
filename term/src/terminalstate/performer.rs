@@ -168,28 +168,18 @@ impl<'a> Performer<'a> {
                 // resized.
                 {
                     let y = self.cursor.y;
-                    let is_conpty = self.state.enable_conpty_quirks;
                     let screen = self.screen_mut();
                     let y = screen.phys_row(y);
 
-                    fn makes_sense_to_wrap(s: &str) -> bool {
-                        let len = s.len();
-                        match (len, s.chars().next()) {
-                            (1, Some(c)) => c.is_alphanumeric() || c.is_ascii_punctuation(),
-                            _ => true,
-                        }
-                    }
-
-                    let should_mark_wrapped = !is_conpty
-                        || screen
-                            .line_mut(y)
-                            .visible_cells()
-                            .last()
-                            .map(|cell| makes_sense_to_wrap(cell.str()))
-                            .unwrap_or(false);
-                    if should_mark_wrapped {
-                        screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
-                    }
+                    // 无条件标记，包括 conpty：conhost 对所有强制换行都
+                    // 记 wrap 标记（无论断点字符是不是空格），resize 的
+                    // 视口 reflow 对齐（Screen::reflow_viewport_conpty）
+                    // 要求双方 wrap 语义一致，否则放宽时 conhost 拼行而
+                    // wezterm 不拼，行数不同导致布局/光标再次失步。
+                    // 历史上 conpty 曾用 makes_sense_to_wrap 启发式跳过
+                    // 「行尾是空格等单字节字符」的标记，副作用是列间空格
+                    // 处软换行的行（如 lsd/ls 网格输出）放宽后永远拼不回。
+                    screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
                 }
                 self.new_line(true);
             }

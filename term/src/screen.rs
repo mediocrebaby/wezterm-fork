@@ -195,6 +195,184 @@ impl Screen {
         adjusted_cursor
     }
 
+    /// ConPTY(conhost) 式视口 reflow。
+    ///
+    /// conhost 在 ConPTY 模式下没有 scrollback：它的缓冲高度就是视口
+    /// 高度，resize 时只对视口内的行 reflow（按 wrapped 标记拼接逻辑行
+    /// 再按新宽度切分），放不下的顶部行被它不可逆地丢弃，不足则底部
+    /// 留白；光标随内容映射。resize 后它几乎不重放任何内容，后续所有
+    /// 视口相对定位(CUP)都假设客户端拥有与它一致的视口布局。
+    ///
+    /// 因此客户端必须模拟同样的过程：只 reflow 视口区的行（scrollback
+    /// 冻结不动——conhost 不知道它存在、也永远不会用 CUP 引用它），
+    /// 顶部滚出的行保留进 scrollback（conhost 丢弃，我们保留是纯收益），
+    /// 底部垫空行到视口高度。
+    ///
+    /// 返回 reflow 后的 (cursor_x, cursor_phys)。
+    fn reflow_viewport_conpty(
+        &mut self,
+        physical_cols: usize,
+        physical_rows: usize,
+        cursor_x: usize,
+        cursor_phys: PhysRowIndex,
+        seqno: SequenceNo,
+    ) -> (usize, PhysRowIndex) {
+        let vp_start = self.lines.len().saturating_sub(self.physical_rows);
+
+        let old_cols = self.physical_cols;
+        let mut viewport: Vec<Line> = self.lines.drain(vp_start..).collect();
+        let rel_cursor = cursor_phys.saturating_sub(vp_start);
+
+        // conhost 的 Reflow 只处理到「max(最后非空行, 光标行)」：光标
+        // 下方的垫空行不参与 reflow，事后重新垫白。若让它们参与，缩窄
+        // 时「内容 + 垫行」几乎必然超出视口高，真实内容行被挤进
+        // scrollback，视口顶从此偏离 conhost 的缓冲顶 —— 此后 conhost
+        // 发的所有 CUP 都落错行（输入与 prompt 分离）。
+        while viewport.len() > rel_cursor + 1
+            && viewport.last().map(Line::is_whitespace).unwrap_or(false)
+        {
+            viewport.pop();
+        }
+
+        // scrollback 区（视口之上）：conhost 丢弃了这些行、后续也永远
+        // 不会用 CUP 引用它们，如何呈现完全是客户端的自由 —— 这里照常
+        // rewrap，使得多跳 resize 中从视口顶滑入 scrollback 的逻辑行
+        // （视口区每跳的切分溢出行）能拼回并按新宽度重排，而不是被
+        // 冻结成某个中间宽度的断行。
+        let scrollback: Vec<Line> = self.lines.drain(..).collect();
+        let mut pending: Option<Line> = None;
+        for mut line in scrollback {
+            line.update_last_change_seqno(seqno);
+            let was_wrapped = line.last_cell_was_wrapped();
+            if was_wrapped {
+                line.set_last_cell_was_wrapped(false, seqno);
+            }
+            let line = match pending.take() {
+                None => line,
+                Some(mut prior) => {
+                    prior.append_line(line, seqno);
+                    prior
+                }
+            };
+            if was_wrapped {
+                pending = Some(line);
+                continue;
+            }
+            if line.len() <= physical_cols {
+                self.lines.push_back(line);
+            } else {
+                for l in line.wrap(physical_cols, seqno) {
+                    self.lines.push_back(l);
+                }
+            }
+        }
+        if let Some(line) = pending {
+            // scrollback 尾行逻辑上延伸进视口区（跨界逻辑行）：重切后
+            // 末段保留 wrapped 标记，使其与视口首行保持可拼接 —— 视口
+            // 区按 conhost 语义独立 reflow，不与这里拼接（行数对齐所
+            // 需），但拼接语义（复制/逻辑行还原）不因此丢失。
+            let mut segs = if line.len() <= physical_cols {
+                vec![line]
+            } else {
+                line.wrap(physical_cols, seqno)
+            };
+            if let Some(last) = segs.last_mut() {
+                last.set_last_cell_was_wrapped(true, seqno);
+            }
+            for l in segs {
+                self.lines.push_back(l);
+            }
+        }
+        let vp_base = self.lines.len();
+
+        let mut reflowed: Vec<Line> = vec![];
+        let mut logical_line: Option<Line> = None;
+        let mut logical_cursor_x: Option<usize> = None;
+        let mut adjusted = (cursor_x, rel_cursor);
+
+        let mut place_cursor = |x: usize,
+                                cursor_x: usize,
+                                base_row: usize,
+                                adjusted: &mut (usize, usize)| {
+            let num_lines = x / physical_cols;
+            let last_x = x - num_lines * physical_cols;
+            *adjusted = (last_x, base_row + num_lines);
+            // 与 rewrap_lines 相同的列 0 特例（见彼处注释）：仅当光标
+            // 确实来自 wrapped 逻辑行的折算（x 是新宽度的非零整数倍）
+            // 时才拉回上一行。
+            if adjusted.0 == 0 && num_lines > 0 {
+                if physical_cols < old_cols {
+                    adjusted.0 = cursor_x;
+                } else {
+                    adjusted.0 = physical_cols;
+                }
+                adjusted.1 -= 1;
+            }
+        };
+
+        for (idx, mut line) in viewport.into_iter().enumerate() {
+            line.update_last_change_seqno(seqno);
+            let was_wrapped = line.last_cell_was_wrapped();
+            if was_wrapped {
+                line.set_last_cell_was_wrapped(false, seqno);
+            }
+            let line = match logical_line.take() {
+                None => {
+                    if idx == rel_cursor {
+                        logical_cursor_x = Some(cursor_x);
+                    }
+                    line
+                }
+                Some(mut prior) => {
+                    if idx == rel_cursor {
+                        logical_cursor_x = Some(cursor_x + prior.len());
+                    }
+                    prior.append_line(line, seqno);
+                    prior
+                }
+            };
+            if was_wrapped {
+                logical_line.replace(line);
+                continue;
+            }
+            if let Some(x) = logical_cursor_x.take() {
+                place_cursor(x, cursor_x, reflowed.len(), &mut adjusted);
+            }
+            if line.len() <= physical_cols {
+                reflowed.push(line);
+            } else {
+                for l in line.wrap(physical_cols, seqno) {
+                    reflowed.push(l);
+                }
+            }
+        }
+        // 视口末行带 wrapped 标记的悬空残留（罕见）：同样切分并结算光标
+        if let Some(line) = logical_line.take() {
+            if let Some(x) = logical_cursor_x.take() {
+                place_cursor(x, cursor_x, reflowed.len(), &mut adjusted);
+            }
+            if line.len() <= physical_cols {
+                reflowed.push(line);
+            } else {
+                for l in line.wrap(physical_cols, seqno) {
+                    reflowed.push(l);
+                }
+            }
+        }
+
+        for line in reflowed {
+            self.lines.push_back(line);
+        }
+        // conhost：缓冲高度=视口高度，内容不足则底部留白（光标下方的
+        // 空行留在视口里，它发的 CUP 以此为坐标系）
+        while self.lines.len() < vp_base + physical_rows {
+            // FIXME: borrow bidi mode from line
+            self.lines.push_back(Line::new(seqno));
+        }
+
+        (adjusted.0, vp_base + adjusted.1)
+    }
+
     /// Resize the physical, viewable portion of the screen
     pub fn resize(
         &mut self,
@@ -221,10 +399,18 @@ impl Screen {
         // pre-prune blank lines that range from the cursor position to the end of the display;
         // this avoids growing the scrollback size when rapidly switching between normal and
         // maximized states.
+        //
+        // ConPTY 例外：conhost 的缓冲高度固定，光标之后的空白行始终
+        // 存在于缓冲里；从这里删掉它们会让「视口=缓冲末尾 rows 行」
+        // 的窗口滑进 scrollback，视口顶随之偏离 conhost 的缓冲顶。
+        // 这些空行也不参与视口 reflow —— reflow_viewport_conpty 会先
+        // 剥掉再垫回（对齐 conhost Reflow 的处理范围）。
         let cursor_phys = self.phys_row(cursor.y);
-        for _ in cursor_phys + 1..self.lines.len() {
-            if self.lines.back().map(Line::is_whitespace).unwrap_or(false) {
-                self.lines.pop_back();
+        if !is_conpty {
+            for _ in cursor_phys + 1..self.lines.len() {
+                if self.lines.back().map(Line::is_whitespace).unwrap_or(false) {
+                    self.lines.pop_back();
+                }
             }
         }
 
@@ -237,7 +423,19 @@ impl Screen {
             // screen (hence the check for allow_scrollback), to avoid
             // conflicting screen updates with full screen apps.
             if self.allow_scrollback {
-                self.rewrap_lines(physical_cols, physical_rows, cursor.x, cursor_phys, seqno)
+                if is_conpty {
+                    // ConPTY：模拟 conhost 的「仅视口内 reflow」，见
+                    // reflow_viewport_conpty 的注释。scrollback 冻结。
+                    self.reflow_viewport_conpty(
+                        physical_cols,
+                        physical_rows,
+                        cursor.x,
+                        cursor_phys,
+                        seqno,
+                    )
+                } else {
+                    self.rewrap_lines(physical_cols, physical_rows, cursor.x, cursor_phys, seqno)
+                }
             } else {
                 for line in &mut self.lines {
                     if physical_cols < self.physical_cols {
@@ -293,23 +491,26 @@ impl Screen {
         let resize_preserves_scrollback = is_conpty;
 
         if resize_preserves_scrollback {
-            new_cursor_y = cursor
-                .y
-                .saturating_add(cursor_y as i64)
-                .saturating_sub(cursor_phys as i64)
-                .max(0);
-
-            // We need to ensure that the bottom of the screen has sufficient lines;
-            // we use simple subtraction of physical_rows from the bottom of the lines
-            // array to define the visible region.  Our resize operation may have
-            // temporarily violated that, which can result in the cursor unintentionally
-            // moving up into the scrollback and damaging the output
-            let required_num_rows_after_cursor =
-                physical_rows.saturating_sub(new_cursor_y as usize);
-            let actual_num_rows_after_cursor = self.lines.len().saturating_sub(cursor_y);
-            for _ in actual_num_rows_after_cursor..required_num_rows_after_cursor {
-                // FIXME: borrow bidi mode from line
-                self.lines.push_back(Line::new(seqno));
+            if physical_cols != self.physical_cols {
+                // 宽度变化：视口区已由 reflow_viewport_conpty 按 conhost
+                // 语义就位（含底部留白），直接换算视口行号即可。
+                new_cursor_y = cursor_y as VisibleRowIndex
+                    - (self.lines.len() as VisibleRowIndex - physical_rows as VisibleRowIndex);
+            } else {
+                // 仅高度变化：conhost(ResizeWithReflow) 保持「光标相对
+                // 视口顶的行号」不变（cursorHeightInViewport 差值平移视
+                // 口），且视口底不高于内容底。等价实现：把缓冲垫高到
+                // 「光标行 + 保持视口行号所需的行数」；若光标行之后内容
+                // 更深，视口底对齐内容底。垫出的空行由下次 resize 前的
+                // pre-prune 回收。
+                let desired_viewport_row = cursor.y.max(0).min(physical_rows as i64 - 1) as usize;
+                let desired_len = cursor_y + (physical_rows - desired_viewport_row);
+                while self.lines.len() < desired_len {
+                    // FIXME: borrow bidi mode from line
+                    self.lines.push_back(Line::new(seqno));
+                }
+                new_cursor_y = cursor_y as VisibleRowIndex
+                    - (self.lines.len() as VisibleRowIndex - physical_rows as VisibleRowIndex);
             }
         } else {
             // Compute the new cursor location; this is logically the inverse
