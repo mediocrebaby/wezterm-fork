@@ -144,12 +144,18 @@ impl Screen {
                 let last_x = x - (num_lines * physical_cols);
                 adjusted_cursor = (last_x, rewrapped.len() + num_lines);
 
-                // Special case: if the cursor lands in column zero, we'll
-                // lose track of its logical association with the wrapped
-                // line and it won't resize with the line correctly.
+                // Special case: if the cursor was inside a wrapped logical
+                // line and lands in column zero after re-flowing (x is a
+                // non-zero multiple of the new width), we'll lose track of
+                // its logical association with the wrapped line and it won't
+                // resize with the line correctly.
                 // Put it back on the prior line. The cursor is now
                 // technically outside of the viewport width.
-                if adjusted_cursor.0 == 0 && adjusted_cursor.1 > 0 {
+                // num_lines > 0 is required: a cursor that was already
+                // sitting in column zero of its own (blank) row -- the normal
+                // state after emitting "\r\n" -- must NOT be pulled up onto
+                // the previous row, or subsequent output overwrites it.
+                if adjusted_cursor.0 == 0 && num_lines > 0 {
                     if physical_cols < self.physical_cols {
                         // getting smaller: preserve its original position
                         // on the prior line
