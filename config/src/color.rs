@@ -479,6 +479,42 @@ impl TryFrom<String> for IntegratedTitleButtonColor {
     }
 }
 
+#[derive(Default, Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+#[dynamic(try_from = "String")]
+pub enum Win32CaptionColor {
+    /// Leave the native title bar caption color to the system default.
+    #[default]
+    Disabled,
+    /// Follow the terminal (resolved palette) background color.
+    Auto,
+    /// Use an explicit color.
+    Custom(RgbaColor),
+}
+
+impl Into<String> for Win32CaptionColor {
+    fn into(self) -> String {
+        match self {
+            Self::Disabled => "none".to_string(),
+            Self::Auto => "auto".to_string(),
+            Self::Custom(color) => color.into(),
+        }
+    }
+}
+
+impl TryFrom<String> for Win32CaptionColor {
+    type Error = <RgbaColor as TryFrom<String>>::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.eq_ignore_ascii_case("auto") {
+            Ok(Self::Auto)
+        } else if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("disabled") {
+            Ok(Self::Disabled)
+        } else {
+            Ok(Self::Custom(RgbaColor::try_from(value)?))
+        }
+    }
+}
+
 fn default_background() -> RgbaColor {
     (0x33, 0x33, 0x33).into()
 }

@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{bail, Context};
 use async_trait::async_trait;
-use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop};
+use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop, Win32CaptionColor};
 use lazy_static::lazy_static;
 use promise::Future;
 use raw_window_handle::{
@@ -1365,6 +1365,8 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
     const DWMWA_USE_IMMERSIVE_DARK_MODE: DWORD = 20;
     const DWMWA_MICA_EFFECT: DWORD = 1029;
     const DWMWA_SYSTEMBACKDROP_TYPE: DWORD = 38;
+    const DWMWA_CAPTION_COLOR: DWORD = 35;
+    const DWMWA_COLOR_DEFAULT: DWORD = 0xFFFF_FFFF;
 
     #[allow(non_camel_case_types)]
     #[allow(dead_code)]
@@ -1433,6 +1435,33 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
 
         if let Some(inner) = rc_from_hwnd(hwnd) {
             let mut inner = inner.borrow_mut();
+
+            // Set the native title bar caption color (Windows 11 build 22000+).
+            // Re-applied here so runtime config / appearance changes take effect.
+            if !*IS_WIN10 {
+                let caption = match &inner.config.win32_caption_color {
+                    Win32CaptionColor::Disabled => None,
+                    Win32CaptionColor::Auto => inner
+                        .config
+                        .resolved_palette
+                        .background
+                        .map(|c| c.to_srgb_u8()),
+                    Win32CaptionColor::Custom(color) => Some(color.to_srgb_u8()),
+                };
+                // DWMWA_CAPTION_COLOR wants a COLORREF (0x00BBGGRR).
+                let colorref: DWORD = match caption {
+                    Some((r, g, b, _)) => {
+                        (r as DWORD) | (g as DWORD) << 8 | (b as DWORD) << 16
+                    }
+                    None => DWMWA_COLOR_DEFAULT,
+                };
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_CAPTION_COLOR,
+                    &colorref as *const _ as *const _,
+                    std::mem::size_of_val(&colorref) as u32,
+                );
+            }
 
             // Set Acrylic or Mica system Backdrop
             let pv_attribute = match inner.config.win32_system_backdrop {
