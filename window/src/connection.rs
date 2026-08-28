@@ -1,5 +1,8 @@
 use crate::screen::Screens;
-use crate::{Appearance, Connection, GeometryOrigin, RequestedWindowGeometry, ResolvedGeometry};
+use crate::{
+    Appearance, Connection, GeometryOrigin, Point, RequestedWindowGeometry, ResolvedGeometry,
+    ScreenPoint, Window,
+};
 use anyhow::Result as Fallible;
 use config::keyassignment::KeyAssignment;
 use config::DimensionContext;
@@ -75,6 +78,16 @@ pub trait ConnectionOps {
 
     /// Perform the system beep/notification sound
     fn beep(&self) {}
+
+    fn supports_cross_window_tab_drag(&self) -> bool {
+        false
+    }
+
+    /// Return the application window that is top-most at `coords`, together
+    /// with the point converted to that window's client coordinates.
+    fn window_at_screen_point(&self, _coords: ScreenPoint) -> Option<(Window, Point)> {
+        None
+    }
 
     /// Returns information about the screens
     fn screens(&self) -> anyhow::Result<Screens> {

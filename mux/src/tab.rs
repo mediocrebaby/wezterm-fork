@@ -2196,7 +2196,7 @@ impl Into<String> for SerdeUrl {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
     use crate::renderable::*;
     use parking_lot::{MappedMutexGuard, Mutex};
@@ -2207,13 +2207,13 @@ mod test {
     use wezterm_term::color::ColorPalette;
     use wezterm_term::{KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex};
 
-    struct FakePane {
+    pub(crate) struct FakePane {
         id: PaneId,
         size: Mutex<TerminalSize>,
     }
 
     impl FakePane {
-        fn new(id: PaneId, size: TerminalSize) -> Arc<dyn Pane> {
+        pub(crate) fn new(id: PaneId, size: TerminalSize) -> Arc<dyn Pane> {
             Arc::new(Self {
                 id,
                 size: Mutex::new(size),

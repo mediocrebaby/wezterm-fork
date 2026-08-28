@@ -1,17 +1,18 @@
 use super::keyboard::{Keyboard, KeyboardWithFallback};
 use crate::connection::ConnectionOps;
-use crate::os::x11::window::XWindowInner;
+use crate::os::x11::window::{XWindow, XWindowInner};
 use crate::os::x11::xsettings::*;
 use crate::os::Connection;
 use crate::screen::{ScreenInfo, Screens};
 use crate::spawn::*;
-use crate::{Appearance, DeadKeyStatus, ScreenRect};
+use crate::{Appearance, DeadKeyStatus, Point, ScreenPoint, ScreenRect, Window};
 use anyhow::{anyhow, bail, Context as _};
 use mio::event::Source;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Registry, Token};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::convert::TryInto;
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -204,6 +205,10 @@ fn get_wm_name(
 }
 
 impl ConnectionOps for XConnection {
+    fn supports_cross_window_tab_drag(&self) -> bool {
+        cfg!(target_os = "linux")
+    }
+
     fn name(&self) -> String {
         match get_wm_name(
             &self.conn,
@@ -255,6 +260,51 @@ impl ConnectionOps for XConnection {
         } else {
             Appearance::Dark
         }
+    }
+
+    fn window_at_screen_point(&self, coords: ScreenPoint) -> Option<(Window, Point)> {
+        let pointer = self
+            .send_and_wait_request(&xcb::x::QueryPointer { window: self.root })
+            .ok()?;
+        let root_child = pointer.child();
+        if root_child == xcb::x::Window::none() {
+            return None;
+        }
+
+        // A reparenting window manager reports its decoration frame as the
+        // root child. Our client window is normally a direct child of it.
+        let window_id = if self.windows.borrow().contains_key(&root_child) {
+            root_child
+        } else {
+            let tree = self
+                .send_and_wait_request(&xcb::x::QueryTree { window: root_child })
+                .ok()?;
+            tree.children()
+                .iter()
+                .copied()
+                .find(|child| self.windows.borrow().contains_key(child))?
+        };
+
+        let translated = self
+            .send_and_wait_request(&xcb::x::TranslateCoordinates {
+                src_window: self.root,
+                dst_window: window_id,
+                src_x: coords.x.try_into().ok()?,
+                src_y: coords.y.try_into().ok()?,
+            })
+            .ok()?;
+        let geometry = self
+            .send_and_wait_request(&xcb::x::GetGeometry {
+                drawable: xcb::x::Drawable::Window(window_id),
+            })
+            .ok()?;
+        let x = isize::from(translated.dst_x());
+        let y = isize::from(translated.dst_y());
+        if x < 0 || y < 0 || x >= geometry.width() as isize || y >= geometry.height() as isize {
+            return None;
+        }
+
+        Some((Window::X11(XWindow::from_id(window_id)), Point::new(x, y)))
     }
 
     fn screens(&self) -> anyhow::Result<Screens> {

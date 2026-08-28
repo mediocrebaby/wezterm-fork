@@ -1017,6 +1017,263 @@ impl Mux {
         Ok(())
     }
 
+    /// Move an existing tab to `destination_window_id` without disturbing its
+    /// panes or their backing processes. `destination_index` is clamped to the
+    /// number of tabs in the destination window.
+    pub fn move_tab_to_window(
+        &self,
+        tab_id: TabId,
+        destination_window_id: WindowId,
+        destination_index: usize,
+    ) -> anyhow::Result<()> {
+        let (source_window_id, source_window_removed) = {
+            let mut windows = self.windows.write();
+            let source_window_id = windows
+                .values()
+                .find(|window| window.idx_by_id(tab_id).is_some())
+                .map(Window::window_id)
+                .ok_or_else(|| {
+                    anyhow!("cannot move tab {tab_id}: it is not attached to a window")
+                })?;
+
+            if !windows.contains_key(&destination_window_id) {
+                anyhow::bail!(
+                    "cannot move tab {tab_id} from window {source_window_id}: destination window {destination_window_id} does not exist"
+                );
+            }
+
+            if source_window_id == destination_window_id {
+                let window = windows.get_mut(&source_window_id).unwrap();
+                let source_index = window.idx_by_id(tab_id).unwrap();
+                let destination_index = destination_index.min(window.len().saturating_sub(1));
+                if source_index == destination_index {
+                    window.set_active_without_saving(source_index);
+                    return Ok(());
+                }
+                let tab = window.remove_by_idx(source_index);
+                let destination_index = destination_index.min(window.len());
+                window.insert(destination_index, &tab);
+                window.set_active_without_saving(destination_index);
+                return Ok(());
+            }
+
+            let tab = {
+                let source = windows.get_mut(&source_window_id).unwrap();
+                let source_index = source.idx_by_id(tab_id).unwrap();
+                source.remove_by_idx(source_index)
+            };
+
+            {
+                let destination = windows.get_mut(&destination_window_id).unwrap();
+                let destination_index = destination_index.min(destination.len());
+                destination.insert(destination_index, &tab);
+                destination.set_active_without_saving(destination_index);
+            }
+
+            let source_window_removed = windows
+                .get(&source_window_id)
+                .map(Window::is_empty)
+                .unwrap_or(false);
+            if source_window_removed {
+                windows.remove(&source_window_id);
+            }
+            (source_window_id, source_window_removed)
+        };
+
+        self.recompute_pane_count();
+        self.notify(MuxNotification::TabAddedToWindow {
+            tab_id,
+            window_id: destination_window_id,
+        });
+        if source_window_removed {
+            self.notify(MuxNotification::WindowRemoved(source_window_id));
+        }
+        Ok(())
+    }
+
+    /// Create a window in the tab's current workspace and move the tab into it.
+    /// If the move fails, the empty destination window is rolled back.
+    pub fn move_tab_to_new_window(
+        &self,
+        tab_id: TabId,
+        position: Option<GuiPosition>,
+    ) -> anyhow::Result<WindowId> {
+        let workspace = {
+            let windows = self.windows.read();
+            windows
+                .values()
+                .find(|window| window.idx_by_id(tab_id).is_some())
+                .map(|window| window.get_workspace().to_string())
+                .ok_or_else(|| {
+                    anyhow!("cannot detach tab {tab_id}: it is not attached to a window")
+                })?
+        };
+
+        let destination = Window::new(Some(workspace), position);
+        let destination_window_id = destination.window_id();
+        self.windows
+            .write()
+            .insert(destination_window_id, destination);
+
+        if let Err(err) = self.move_tab_to_window(tab_id, destination_window_id, 0) {
+            self.windows.write().remove(&destination_window_id);
+            return Err(err).with_context(|| {
+                format!("moving tab {tab_id} into newly created window {destination_window_id}")
+            });
+        }
+
+        self.notify(MuxNotification::WindowCreated(destination_window_id));
+        Ok(destination_window_id)
+    }
+
+    /// Move the sole pane from `source_tab_id` into a split next to
+    /// `target_pane_id`.  The pane object itself is retained, so its backing
+    /// process and terminal state continue uninterrupted.
+    pub fn move_single_pane_tab_to_split(
+        &self,
+        source_tab_id: TabId,
+        target_pane_id: PaneId,
+        request: SplitRequest,
+    ) -> anyhow::Result<()> {
+        let source_tab = self
+            .get_tab(source_tab_id)
+            .ok_or_else(|| anyhow!("cannot split dragged tab {source_tab_id}: tab not found"))?;
+        let source_panes = source_tab.iter_panes_ignoring_zoom();
+        if source_panes.len() != 1 {
+            anyhow::bail!(
+                "cannot split dragged tab {source_tab_id}: expected one pane, found {}",
+                source_panes.len()
+            );
+        }
+
+        self.move_pane_to_split(source_panes[0].pane.pane_id(), target_pane_id, request)
+            .with_context(|| {
+                format!("moving the sole pane from dragged tab {source_tab_id} into a split")
+            })
+    }
+
+    /// Move an existing pane next to `target_pane_id` without restarting its
+    /// backing process. The destination insertion is rolled back if the pane
+    /// cannot subsequently be removed from its source tab.
+    pub fn move_pane_to_split(
+        &self,
+        source_pane_id: PaneId,
+        target_pane_id: PaneId,
+        request: SplitRequest,
+    ) -> anyhow::Result<()> {
+        if source_pane_id == target_pane_id {
+            anyhow::bail!("cannot move pane {source_pane_id} beside itself");
+        }
+
+        let (_source_domain_id, source_window_id, source_tab_id) = self
+            .resolve_pane_id(source_pane_id)
+            .ok_or_else(|| anyhow!("cannot move pane {source_pane_id}: pane not found"))?;
+        let (_target_domain_id, destination_window_id, destination_tab_id) = self
+            .resolve_pane_id(target_pane_id)
+            .ok_or_else(|| anyhow!("cannot split onto pane {target_pane_id}: pane not found"))?;
+        if destination_tab_id == source_tab_id {
+            anyhow::bail!(
+                "cannot move pane {source_pane_id} beside pane {target_pane_id}: both are in tab {source_tab_id}"
+            );
+        }
+
+        let source_tab = self.get_tab(source_tab_id).ok_or_else(|| {
+            anyhow!("cannot move pane {source_pane_id}: source tab {source_tab_id} not found")
+        })?;
+        let destination_tab = self.get_tab(destination_tab_id).ok_or_else(|| {
+            anyhow!(
+                "cannot move pane {source_pane_id}: destination tab {destination_tab_id} not found"
+            )
+        })?;
+        if destination_tab.get_zoomed_pane().is_some() {
+            anyhow::bail!(
+                "cannot move pane {source_pane_id} into destination tab {destination_tab_id}: destination is zoomed"
+            );
+        }
+        let destination_index = destination_tab
+            .iter_panes_ignoring_zoom()
+            .into_iter()
+            .find(|positioned| positioned.pane.pane_id() == target_pane_id)
+            .map(|positioned| positioned.index)
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot move pane {source_pane_id}: target pane {target_pane_id} is not in destination tab {destination_tab_id}"
+                )
+            })?;
+
+        let split_size = destination_tab
+            .compute_split_size(destination_index, request)
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot move pane {source_pane_id}: invalid destination pane index {destination_index} in tab {destination_tab_id}"
+                )
+            })?;
+        if split_size.first.rows == 0
+            || split_size.first.cols == 0
+            || split_size.second.rows == 0
+            || split_size.second.cols == 0
+        {
+            anyhow::bail!(
+                "cannot move pane {source_pane_id} beside pane {target_pane_id}: destination tab {destination_tab_id} is too small"
+            );
+        }
+
+        let source_pane = source_tab
+            .iter_panes_ignoring_zoom()
+            .into_iter()
+            .find(|positioned| positioned.pane.pane_id() == source_pane_id)
+            .map(|positioned| positioned.pane)
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot move pane {source_pane_id}: pane is not in resolved source tab {source_tab_id}"
+                )
+            })?;
+
+        let inserted_index = destination_tab
+            .split_and_insert(destination_index, request, Arc::clone(&source_pane))
+            .with_context(|| {
+                format!(
+                    "inserting pane {source_pane_id} beside pane {target_pane_id} in tab {destination_tab_id}"
+                )
+            })?;
+
+        if source_tab.remove_pane(source_pane_id).is_none() {
+            let rollback_succeeded = destination_tab.remove_pane(source_pane_id).is_some();
+            anyhow::bail!(
+                "inserted pane {source_pane_id} into tab {destination_tab_id}, but it disappeared from source tab {source_tab_id}; destination rollback succeeded: {rollback_succeeded}"
+            );
+        }
+        destination_tab.set_active_idx(inserted_index);
+
+        if source_tab.is_dead() {
+            self.remove_tab(source_tab_id);
+        } else {
+            self.notify(MuxNotification::WindowInvalidated(source_window_id));
+        }
+        self.recompute_pane_count();
+        match self.get_window_mut(destination_window_id) {
+            Some(mut destination_window) => {
+                if let Some(destination_tab_index) =
+                    destination_window.idx_by_id(destination_tab_id)
+                {
+                    destination_window.set_active_without_saving(destination_tab_index);
+                } else {
+                    log::error!(
+                        "moved pane {source_pane_id}, but destination tab {destination_tab_id} disappeared from window {destination_window_id} before it could be focused"
+                    );
+                }
+            }
+            None => {
+                log::error!(
+                    "moved pane {source_pane_id}, but destination window {destination_window_id} disappeared before it could be focused"
+                );
+            }
+        }
+        self.notify(MuxNotification::WindowInvalidated(destination_window_id));
+        self.notify(MuxNotification::PaneFocused(source_pane_id));
+        Ok(())
+    }
+
     pub fn window_containing_tab(&self, tab_id: TabId) -> Option<WindowId> {
         for w in self.windows.read().values() {
             for t in w.iter() {
@@ -1474,5 +1731,167 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
                 data: Arc::new(data),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    static MUX_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn move_tab_preserves_tabs_across_reorder_merge_and_detach() {
+        let _guard = MUX_TEST_LOCK.lock().unwrap();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+
+        let source_window = Window::new(Some("source".to_string()), None);
+        let source_window_id = source_window.window_id();
+        let destination_window = Window::new(Some("destination".to_string()), None);
+        let destination_window_id = destination_window.window_id();
+        mux.windows.write().insert(source_window_id, source_window);
+        mux.windows
+            .write()
+            .insert(destination_window_id, destination_window);
+        let first = Arc::new(Tab::new(&TerminalSize::default()));
+        let moved = Arc::new(Tab::new(&TerminalSize::default()));
+        let destination_tab = Arc::new(Tab::new(&TerminalSize::default()));
+
+        for tab in [&first, &moved, &destination_tab] {
+            mux.add_tab_no_panes(tab);
+        }
+        mux.add_tab_to_window(&first, source_window_id).unwrap();
+        mux.add_tab_to_window(&moved, source_window_id).unwrap();
+        mux.add_tab_to_window(&destination_tab, destination_window_id)
+            .unwrap();
+
+        mux.move_tab_to_window(moved.tab_id(), destination_window_id, 0)
+            .unwrap();
+
+        let source = mux.get_window(source_window_id).unwrap();
+        assert_eq!(source.len(), 1);
+        assert_eq!(source.get_by_idx(0).unwrap().tab_id(), first.tab_id());
+        drop(source);
+
+        let destination = mux.get_window(destination_window_id).unwrap();
+        assert_eq!(destination.len(), 2);
+        assert_eq!(destination.get_by_idx(0).unwrap().tab_id(), moved.tab_id());
+        assert_eq!(
+            destination.get_by_idx(1).unwrap().tab_id(),
+            destination_tab.tab_id()
+        );
+        assert_eq!(destination.get_active_idx(), 0);
+        drop(destination);
+
+        assert_eq!(
+            mux.window_containing_tab(moved.tab_id()),
+            Some(destination_window_id)
+        );
+        assert!(Arc::ptr_eq(&mux.get_tab(moved.tab_id()).unwrap(), &moved));
+
+        mux.move_tab_to_window(moved.tab_id(), destination_window_id, 1)
+            .unwrap();
+        let destination = mux.get_window(destination_window_id).unwrap();
+        assert_eq!(destination.get_active_idx(), 1);
+        assert_eq!(
+            destination.get_by_idx(0).unwrap().tab_id(),
+            destination_tab.tab_id()
+        );
+        assert_eq!(destination.get_by_idx(1).unwrap().tab_id(), moved.tab_id());
+        drop(destination);
+
+        mux.move_tab_to_window(first.tab_id(), destination_window_id, usize::MAX)
+            .unwrap();
+        assert!(mux.get_window(source_window_id).is_none());
+        let destination = mux.get_window(destination_window_id).unwrap();
+        assert_eq!(destination.len(), 3);
+        assert_eq!(destination.get_active_idx(), 2);
+        assert_eq!(destination.get_by_idx(2).unwrap().tab_id(), first.tab_id());
+        drop(destination);
+
+        let detached_window_id = mux
+            .move_tab_to_new_window(destination_tab.tab_id(), None)
+            .unwrap();
+        let detached = mux.get_window(detached_window_id).unwrap();
+        assert_eq!(detached.get_workspace(), "destination");
+        assert_eq!(detached.len(), 1);
+        assert_eq!(
+            detached.get_by_idx(0).unwrap().tab_id(),
+            destination_tab.tab_id()
+        );
+        assert!(Arc::ptr_eq(
+            &mux.get_tab(destination_tab.tab_id()).unwrap(),
+            &destination_tab
+        ));
+        drop(detached);
+
+        let source_pane = crate::tab::test::FakePane::new(10_001, TerminalSize::default());
+        let target_pane = crate::tab::test::FakePane::new(10_002, TerminalSize::default());
+        destination_tab.assign_pane(&source_pane);
+        moved.assign_pane(&target_pane);
+        mux.add_pane(&source_pane).unwrap();
+        mux.add_pane(&target_pane).unwrap();
+
+        mux.move_single_pane_tab_to_split(
+            destination_tab.tab_id(),
+            target_pane.pane_id(),
+            SplitRequest {
+                direction: crate::tab::SplitDirection::Horizontal,
+                target_is_second: true,
+                top_level: false,
+                size: crate::tab::SplitSize::Percent(50),
+            },
+        )
+        .unwrap();
+
+        assert!(mux.get_window(detached_window_id).is_none());
+        assert!(mux.get_tab(destination_tab.tab_id()).is_none());
+        assert!(mux.get_pane(source_pane.pane_id()).is_some());
+        let panes = moved.iter_panes_ignoring_zoom();
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].pane.pane_id(), target_pane.pane_id());
+        assert_eq!(panes[1].pane.pane_id(), source_pane.pane_id());
+
+        let second_target_pane = crate::tab::test::FakePane::new(10_003, TerminalSize::default());
+        let second_target_tab = Arc::new(Tab::new(&TerminalSize::default()));
+        second_target_tab.assign_pane(&second_target_pane);
+        mux.add_tab_and_active_pane(&second_target_tab).unwrap();
+        mux.add_tab_to_window(&second_target_tab, destination_window_id)
+            .unwrap();
+        mux.move_pane_to_split(
+            source_pane.pane_id(),
+            second_target_pane.pane_id(),
+            SplitRequest {
+                direction: crate::tab::SplitDirection::Vertical,
+                target_is_second: false,
+                top_level: false,
+                size: crate::tab::SplitSize::Percent(50),
+            },
+        )
+        .unwrap();
+
+        let source_panes = moved.iter_panes_ignoring_zoom();
+        assert_eq!(source_panes.len(), 1);
+        assert_eq!(source_panes[0].pane.pane_id(), target_pane.pane_id());
+        let destination_panes = second_target_tab.iter_panes_ignoring_zoom();
+        assert_eq!(destination_panes.len(), 2);
+        assert_eq!(destination_panes[0].pane.pane_id(), source_pane.pane_id());
+        assert_eq!(
+            destination_panes[1].pane.pane_id(),
+            second_target_pane.pane_id()
+        );
+        assert!(mux.get_pane(source_pane.pane_id()).is_some());
+        assert!(mux
+            .move_pane_to_split(
+                source_pane.pane_id(),
+                second_target_pane.pane_id(),
+                SplitRequest::default(),
+            )
+            .is_err());
+        assert_eq!(second_target_tab.iter_panes_ignoring_zoom().len(), 2);
+
+        Mux::shutdown();
     }
 }

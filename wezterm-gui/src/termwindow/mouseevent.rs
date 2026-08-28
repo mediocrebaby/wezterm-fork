@@ -1,15 +1,17 @@
 use crate::tabbar::TabBarItem;
 use crate::termwindow::{
-    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
+    DragDropSource, GuiWin, MouseCapture, PaneDragState, PositionedSplit, ScrollHit, TabDragState,
+    TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
-    MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
-    WindowDecorations, WindowOps, WindowState,
+    Connection, ConnectionOps, MouseButtons as WMB, MouseCursor, MouseEvent,
+    MouseEventKind as WMEK, MousePress, Point, RectF, ScreenPoint, Size, WindowDecorations,
+    WindowOps, WindowState,
 };
 use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
 use config::MouseEventAltScreen;
 use mux::pane::{Pane, WithPaneLines};
-use mux::tab::SplitDirection;
+use mux::tab::{SplitDirection, SplitRequest, SplitSize};
 use mux::Mux;
 use mux_lua::MuxPane;
 use std::convert::TryInto;
@@ -23,14 +25,21 @@ use wezterm_dynamic::ToDynamic;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
+const DRAG_THRESHOLD_PIXELS: isize = 6;
+const DROP_EDGE_FRACTION: f32 = 0.25;
+const DROP_SPLIT_PERCENT: u8 = 50;
+const TAB_BAR_DROP_MARKER_WIDTH_PIXELS: f32 = 4.0;
+
 impl super::TermWindow {
     fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
-        let x = event.coords.x;
-        let y = event.coords.y;
+        self.resolve_ui_item_at(event.coords)
+    }
+
+    fn resolve_ui_item_at(&self, point: Point) -> Option<UIItem> {
         self.ui_items
             .iter()
             .rev()
-            .find(|item| item.hit_test(x, y))
+            .find(|item| item.hit_test(point.x, point.y))
             .cloned()
     }
 
@@ -43,7 +52,8 @@ impl super::TermWindow {
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
-            | UIItemType::Split(_) => {}
+            | UIItemType::Split(_)
+            | UIItemType::PaneDragHandle(_) => {}
         }
     }
 
@@ -54,7 +64,8 @@ impl super::TermWindow {
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
-            | UIItemType::Split(_) => {}
+            | UIItemType::Split(_)
+            | UIItemType::PaneDragHandle(_) => {}
         }
     }
 
@@ -125,6 +136,24 @@ impl super::TermWindow {
             WMEK::Release(ref press) => {
                 self.current_mouse_capture = None;
                 self.current_mouse_buttons.retain(|p| p != press);
+                if press == &MousePress::Left {
+                    if let Some(pane_drag) = self.pane_drag.take() {
+                        if pane_drag.started {
+                            self.finish_pane_drag(pane_drag, &event);
+                        }
+                        context.set_cursor(Some(MouseCursor::Arrow));
+                        context.invalidate();
+                        return;
+                    }
+                    if let Some(tab_drag) = self.tab_drag.take() {
+                        if tab_drag.started {
+                            self.finish_tab_drag(tab_drag, &event);
+                        }
+                        context.set_cursor(Some(MouseCursor::Arrow));
+                        context.invalidate();
+                        return;
+                    }
+                }
                 if press == &MousePress::Left && self.window_drag_position.take().is_some() {
                     // Completed a window drag
                     return;
@@ -158,6 +187,15 @@ impl super::TermWindow {
             }
 
             WMEK::Move => {
+                if let Some(pane_drag) = self.pane_drag.take() {
+                    self.drag_pane(pane_drag, &event, context);
+                    return;
+                }
+                if let Some(tab_drag) = self.tab_drag.take() {
+                    self.drag_tab(tab_drag, &event, context);
+                    return;
+                }
+
                 if let Some(start) = self.window_drag_position.as_ref() {
                     // Dragging the window
                     // Compute the distance since the initial event
@@ -249,6 +287,794 @@ impl super::TermWindow {
         self.update_title();
         context.set_cursor(Some(MouseCursor::Arrow));
         context.invalidate();
+    }
+
+    fn mouse_event_pane_drag_handle(
+        &mut self,
+        pane_id: mux::pane::PaneId,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind != WMEK::Press(MousePress::Left) {
+            return;
+        }
+
+        let mux = Mux::get();
+        let Some((_domain_id, source_window_id, source_tab_id)) = mux.resolve_pane_id(pane_id)
+        else {
+            log::error!("cannot start dragging pane {pane_id}: pane is not attached to the mux");
+            return;
+        };
+        if source_window_id != self.mux_window_id {
+            log::error!(
+                "cannot start dragging pane {pane_id}: pane belongs to window {source_window_id}, not GUI window {}",
+                self.mux_window_id
+            );
+            return;
+        }
+        if let Some(source_tab) = mux.get_tab(source_tab_id) {
+            if let Some(source_index) = source_tab
+                .iter_panes_ignoring_zoom()
+                .into_iter()
+                .find(|positioned| positioned.pane.pane_id() == pane_id)
+                .map(|positioned| positioned.index)
+            {
+                source_tab.set_active_idx(source_index);
+            }
+        }
+
+        let same_window_target_tab_id = mux.get_window(self.mux_window_id).and_then(|window| {
+            window
+                .get_last_active_idx()
+                .and_then(|idx| window.get_by_idx(idx))
+                .map(|tab| tab.tab_id())
+                .filter(|target_id| *target_id != source_tab_id)
+                .or_else(|| {
+                    window
+                        .iter()
+                        .find(|tab| tab.tab_id() != source_tab_id)
+                        .map(|tab| tab.tab_id())
+                })
+        });
+        self.pane_drag = Some(PaneDragState {
+            pane_id,
+            source_tab_id,
+            start_event: event.clone(),
+            grab_offset: Point::new(
+                event.coords.x.saturating_sub(item.x as isize),
+                event.coords.y.saturating_sub(item.y as isize),
+            ),
+            dragged_size: Size::new(item.width as isize, item.height as isize),
+            current_coords: event.coords,
+            preview_window: None,
+            same_window_target_tab_id,
+            started: false,
+        });
+    }
+
+    fn drag_pane(
+        &mut self,
+        mut pane_drag: PaneDragState,
+        event: &MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        pane_drag.current_coords = event.coords;
+        if !pane_drag.started {
+            let delta_x = (event.screen_coords.x - pane_drag.start_event.screen_coords.x).abs();
+            let delta_y = (event.screen_coords.y - pane_drag.start_event.screen_coords.y).abs();
+            pane_drag.started = delta_x.max(delta_y) >= DRAG_THRESHOLD_PIXELS;
+        }
+        if !pane_drag.started {
+            self.pane_drag = Some(pane_drag);
+            return;
+        }
+
+        context.set_cursor(Some(MouseCursor::Hand));
+        let source = DragDropSource::Pane {
+            pane_id: pane_drag.pane_id,
+            tab_id: pane_drag.source_tab_id,
+        };
+        let supports_cross_window_drag = Connection::get()
+            .map(|connection| connection.supports_cross_window_tab_drag())
+            .unwrap_or(false);
+        let mut preview_window = None;
+        let mut source_client_point = None;
+        if supports_cross_window_drag {
+            if let Some((target, client_point)) =
+                crate::frontend::front_end().gui_window_at_screen_point(event.screen_coords)
+            {
+                if target.mux_window_id == self.mux_window_id {
+                    source_client_point = Some(client_point);
+                } else {
+                    target
+                        .window
+                        .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                            term_window.update_drop_preview(source, client_point);
+                        })));
+                    preview_window = Some(target.window);
+                }
+            }
+        } else if self.point_is_in_client(event.coords) {
+            source_client_point = Some(event.coords);
+        }
+
+        if pane_drag.preview_window != preview_window {
+            if let Some(window) = pane_drag.preview_window.take() {
+                window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                    term_window.clear_drag_drop_preview();
+                })));
+            }
+            pane_drag.preview_window = preview_window;
+        }
+
+        if let Some(point) = source_client_point {
+            let over_tab_bar = self
+                .tab_bar_drop_bounds()
+                .map(|bounds| Self::point_in_rect(point, bounds))
+                .unwrap_or(false);
+            if !over_tab_bar {
+                if let Some(target_tab_id) = pane_drag.same_window_target_tab_id {
+                    if let Some(mut window) = Mux::get().get_window_mut(self.mux_window_id) {
+                        if let Some(target_index) = window.idx_by_id(target_tab_id) {
+                            window.set_active_without_saving(target_index);
+                        }
+                    }
+                }
+            }
+            self.update_drop_preview(source, point);
+        } else {
+            self.clear_drag_drop_preview();
+        }
+
+        context.invalidate();
+        self.pane_drag = Some(pane_drag);
+    }
+
+    fn finish_pane_drag(&mut self, mut pane_drag: PaneDragState, event: &MouseEvent) {
+        if let Some(window) = pane_drag.preview_window.take() {
+            window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                term_window.clear_drag_drop_preview();
+            })));
+        }
+        self.clear_drag_drop_preview();
+
+        let source = DragDropSource::Pane {
+            pane_id: pane_drag.pane_id,
+            tab_id: pane_drag.source_tab_id,
+        };
+        let supports_cross_window_drag = Connection::get()
+            .map(|connection| connection.supports_cross_window_tab_drag())
+            .unwrap_or(false);
+        let target = if supports_cross_window_drag {
+            crate::frontend::front_end().gui_window_at_screen_point(event.screen_coords)
+        } else {
+            None
+        };
+
+        match target {
+            Some((target, client_point)) if target.mux_window_id == self.mux_window_id => {
+                self.finish_local_pane_drop(source, client_point);
+            }
+            Some((target, client_point)) => {
+                let pane_id = pane_drag.pane_id;
+                let source_tab_id = pane_drag.source_tab_id;
+                target
+                    .window
+                    .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        term_window.accept_pane_drop(pane_id, source_tab_id, client_point);
+                    })));
+            }
+            None if !supports_cross_window_drag && self.point_is_in_client(event.coords) => {
+                self.finish_local_pane_drop(source, event.coords);
+            }
+            None if supports_cross_window_drag => {
+                Self::detach_pane_to_new_window(
+                    pane_drag.pane_id,
+                    pane_drag.source_tab_id,
+                    event.screen_coords,
+                    pane_drag.grab_offset,
+                );
+            }
+            None => Self::restore_drag_source_tab(pane_drag.source_tab_id),
+        }
+    }
+
+    fn finish_local_pane_drop(&mut self, source: DragDropSource, client_point: Point) {
+        if self.drop_preview_at(source, client_point).is_some() {
+            if let DragDropSource::Pane { pane_id, tab_id } = source {
+                self.accept_pane_drop(pane_id, tab_id, client_point);
+            }
+        } else {
+            Self::restore_drag_source_tab(source.tab_id());
+        }
+    }
+
+    fn restore_drag_source_tab(source_tab_id: mux::tab::TabId) {
+        let mux = Mux::get();
+        if let Some(source_window_id) = mux.window_containing_tab(source_tab_id) {
+            if let Some(mut window) = mux.get_window_mut(source_window_id) {
+                if let Some(source_index) = window.idx_by_id(source_tab_id) {
+                    window.set_active_without_saving(source_index);
+                }
+            }
+        }
+    }
+
+    fn point_is_in_client(&self, point: Point) -> bool {
+        point.x >= 0
+            && point.y >= 0
+            && point.x < self.dimensions.pixel_width as isize
+            && point.y < self.dimensions.pixel_height as isize
+    }
+
+    fn drag_tab(
+        &mut self,
+        mut tab_drag: TabDragState,
+        event: &MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        tab_drag.current_coords = event.coords;
+        if !tab_drag.started {
+            let delta_x = (event.screen_coords.x - tab_drag.start_event.screen_coords.x).abs();
+            let delta_y = (event.screen_coords.y - tab_drag.start_event.screen_coords.y).abs();
+            tab_drag.started = delta_x.max(delta_y) >= DRAG_THRESHOLD_PIXELS;
+        }
+
+        if tab_drag.started {
+            context.set_cursor(Some(MouseCursor::Hand));
+            let mut preview_window = None;
+            let mut source_client_point = None;
+            if Connection::get()
+                .map(|connection| connection.supports_cross_window_tab_drag())
+                .unwrap_or(false)
+            {
+                if let Some((target, client_point)) =
+                    crate::frontend::front_end().gui_window_at_screen_point(event.screen_coords)
+                {
+                    if target.mux_window_id != self.mux_window_id {
+                        let tab_id = tab_drag.tab_id;
+                        target.window.notify(TermWindowNotif::Apply(Box::new(
+                            move |term_window| {
+                                term_window
+                                    .update_drop_preview(DragDropSource::Tab(tab_id), client_point);
+                            },
+                        )));
+                        preview_window = Some(target.window);
+                    } else {
+                        source_client_point = Some(client_point);
+                    }
+                }
+            }
+
+            if tab_drag.preview_window != preview_window {
+                if let Some(window) = tab_drag.preview_window.take() {
+                    window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                        term_window.clear_drag_drop_preview();
+                    })));
+                }
+                tab_drag.preview_window = preview_window;
+            }
+
+            let over_source_tab_bar = source_client_point
+                .and_then(|point| self.tab_bar_drop_bounds().map(|bounds| (point, bounds)))
+                .map(|(point, bounds)| Self::point_in_rect(point, bounds))
+                .unwrap_or(false);
+            if let (Some(point), Some(target_tab_id)) =
+                (source_client_point, tab_drag.same_window_target_tab_id)
+            {
+                if !over_source_tab_bar {
+                    if let Some(mut window) = Mux::get().get_window_mut(self.mux_window_id) {
+                        if let Some(target_index) = window.idx_by_id(target_tab_id) {
+                            window.set_active_without_saving(target_index);
+                        }
+                    }
+                    self.update_drop_preview(DragDropSource::Tab(tab_drag.tab_id), point);
+                } else {
+                    self.clear_drag_drop_preview();
+                }
+            } else {
+                self.clear_drag_drop_preview();
+            }
+
+            if tab_drag.preview_window.is_none() && self.drag_drop_preview.is_none() {
+                if let Some(UIItem {
+                    item_type: UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }),
+                    ..
+                }) = self.resolve_ui_item(event)
+                {
+                    if let Err(err) =
+                        Mux::get().move_tab_to_window(tab_drag.tab_id, self.mux_window_id, tab_idx)
+                    {
+                        log::error!(
+                            "reordering dragged tab {} in window {}: {err:#}",
+                            tab_drag.tab_id,
+                            self.mux_window_id
+                        );
+                    }
+                }
+            }
+            context.invalidate();
+        }
+
+        self.tab_drag.replace(tab_drag);
+    }
+
+    fn finish_tab_drag(&mut self, mut tab_drag: TabDragState, event: &MouseEvent) {
+        if let Some(window) = tab_drag.preview_window.take() {
+            window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                term_window.clear_drag_drop_preview();
+            })));
+        }
+        self.clear_drag_drop_preview();
+
+        let Some(connection) = Connection::get() else {
+            return;
+        };
+        if !connection.supports_cross_window_tab_drag() {
+            return;
+        }
+
+        let grab_offset = tab_drag.grab_offset;
+        match crate::frontend::front_end().gui_window_at_screen_point(event.screen_coords) {
+            Some((target, client_point)) if target.mux_window_id == self.mux_window_id => {
+                if self
+                    .drop_preview_at(DragDropSource::Tab(tab_drag.tab_id), client_point)
+                    .is_some()
+                {
+                    self.accept_tab_drop(
+                        tab_drag.tab_id,
+                        client_point,
+                        event.screen_coords,
+                        grab_offset,
+                    );
+                } else if let Some(mut window) = Mux::get().get_window_mut(self.mux_window_id) {
+                    if let Some(source_index) = window.idx_by_id(tab_drag.tab_id) {
+                        window.set_active_without_saving(source_index);
+                    }
+                }
+            }
+            Some((target, client_point)) => {
+                let tab_id = tab_drag.tab_id;
+                let screen_point = event.screen_coords;
+                target
+                    .window
+                    .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        term_window.accept_tab_drop(
+                            tab_id,
+                            client_point,
+                            screen_point,
+                            grab_offset,
+                        );
+                    })));
+            }
+            None => {
+                Self::detach_tab_to_new_window(tab_drag.tab_id, event.screen_coords, grab_offset);
+            }
+        }
+    }
+
+    fn accept_tab_drop(
+        &mut self,
+        tab_id: mux::tab::TabId,
+        client_point: Point,
+        screen_point: ScreenPoint,
+        grab_offset: Point,
+    ) {
+        let mux = Mux::get();
+        match self.drop_preview_at(DragDropSource::Tab(tab_id), client_point) {
+            Some(super::DragDropPreview {
+                action: super::DragDropAction::Merge { destination_index },
+                ..
+            }) => {
+                if let Err(err) =
+                    mux.move_tab_to_window(tab_id, self.mux_window_id, destination_index)
+                {
+                    log::error!(
+                        "moving dragged tab {tab_id} into window {} at index {destination_index}: {err:#}",
+                        self.mux_window_id
+                    );
+                }
+            }
+            Some(super::DragDropPreview {
+                action:
+                    super::DragDropAction::Split {
+                        target_pane_id,
+                        request,
+                    },
+                ..
+            }) => {
+                if let Err(err) = mux.move_single_pane_tab_to_split(tab_id, target_pane_id, request)
+                {
+                    log::error!(
+                        "splitting dragged tab {tab_id} onto pane {target_pane_id}: {err:#}"
+                    );
+                    let destination_index = mux
+                        .get_window(self.mux_window_id)
+                        .map(|window| window.len())
+                        .unwrap_or(0);
+                    if let Err(fallback_err) =
+                        mux.move_tab_to_window(tab_id, self.mux_window_id, destination_index)
+                    {
+                        log::error!(
+                            "falling back to merging dragged tab {tab_id} into window {} after split failed: {fallback_err:#}",
+                            self.mux_window_id
+                        );
+                    }
+                }
+            }
+            None => Self::detach_tab_to_new_window(tab_id, screen_point, grab_offset),
+        }
+    }
+
+    fn accept_pane_drop(
+        &mut self,
+        pane_id: mux::pane::PaneId,
+        source_tab_id: mux::tab::TabId,
+        client_point: Point,
+    ) {
+        let source = DragDropSource::Pane {
+            pane_id,
+            tab_id: source_tab_id,
+        };
+        match self.drop_preview_at(source, client_point) {
+            Some(super::DragDropPreview {
+                action: super::DragDropAction::Merge { destination_index },
+                ..
+            }) => Self::move_pane_to_tab(
+                pane_id,
+                source_tab_id,
+                self.mux_window_id,
+                destination_index,
+            ),
+            Some(super::DragDropPreview {
+                action:
+                    super::DragDropAction::Split {
+                        target_pane_id,
+                        request,
+                    },
+                ..
+            }) => {
+                if let Err(err) = Mux::get().move_pane_to_split(pane_id, target_pane_id, request) {
+                    log::error!(
+                        "moving dragged pane {pane_id} beside target pane {target_pane_id}: {err:#}"
+                    );
+                }
+            }
+            None => Self::restore_drag_source_tab(source_tab_id),
+        }
+    }
+
+    fn move_pane_to_tab(
+        pane_id: mux::pane::PaneId,
+        source_tab_id: mux::tab::TabId,
+        destination_window_id: mux::window::WindowId,
+        destination_index: usize,
+    ) {
+        let mux = Mux::get();
+        let source_is_single_pane = mux
+            .get_tab(source_tab_id)
+            .map(|tab| tab.iter_panes_ignoring_zoom().len() == 1)
+            .unwrap_or(false);
+        if source_is_single_pane {
+            if let Err(err) =
+                mux.move_tab_to_window(source_tab_id, destination_window_id, destination_index)
+            {
+                log::error!(
+                    "moving single-pane tab {source_tab_id} for dragged pane {pane_id} into window {destination_window_id} at index {destination_index}: {err:#}"
+                );
+            }
+            return;
+        }
+
+        promise::spawn::spawn(async move {
+            let moved = mux
+                .move_pane_to_new_tab(pane_id, Some(destination_window_id), None)
+                .await;
+            match moved {
+                Ok((tab, actual_window_id)) => {
+                    if let Err(err) =
+                        mux.move_tab_to_window(tab.tab_id(), actual_window_id, destination_index)
+                    {
+                        log::error!(
+                            "placing new tab {} for dragged pane {pane_id} in window {actual_window_id} at index {destination_index}: {err:#}",
+                            tab.tab_id()
+                        );
+                    }
+                    if let Err(err) = mux.focus_pane_and_containing_tab(pane_id) {
+                        log::error!("focusing pane {pane_id} after moving it to a tab: {err:#}");
+                    }
+                }
+                Err(err) => {
+                    log::error!(
+                        "moving pane {pane_id} from tab {source_tab_id} into a new tab in window {destination_window_id}: {err:#}"
+                    );
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn detach_pane_to_new_window(
+        pane_id: mux::pane::PaneId,
+        source_tab_id: mux::tab::TabId,
+        point: ScreenPoint,
+        grab_offset: Point,
+    ) {
+        let mux = Mux::get();
+        let source_is_single_pane = mux
+            .get_tab(source_tab_id)
+            .map(|tab| tab.iter_panes_ignoring_zoom().len() == 1)
+            .unwrap_or(false);
+        if source_is_single_pane {
+            let position = config::GuiPosition {
+                x: config::Dimension::Pixels((point.x - grab_offset.x) as f32),
+                y: config::Dimension::Pixels((point.y - grab_offset.y) as f32),
+                origin: config::GeometryOrigin::ScreenCoordinateSystem,
+            };
+            if let Err(err) = mux.move_tab_to_new_window(source_tab_id, Some(position)) {
+                log::error!(
+                    "detaching single-pane tab {source_tab_id} for pane {pane_id} into a new window at ({}, {}): {err:#}",
+                    point.x,
+                    point.y
+                );
+            }
+            return;
+        }
+
+        promise::spawn::spawn(async move {
+            match mux.move_pane_to_new_tab(pane_id, None, None).await {
+                Ok((_tab, _window_id)) => {
+                    if let Err(err) = mux.focus_pane_and_containing_tab(pane_id) {
+                        log::error!(
+                            "focusing pane {pane_id} after detaching it into a new window: {err:#}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    log::error!(
+                        "detaching pane {pane_id} from tab {source_tab_id} into a new window: {err:#}"
+                    );
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn tab_drop_index(&self, point: Point) -> Option<usize> {
+        let item = self.resolve_ui_item_at(point)?;
+        match item.item_type {
+            UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) => {
+                let midpoint = item.x.saturating_add(item.width / 2) as isize;
+                Some(tab_idx + usize::from(point.x > midpoint))
+            }
+            UIItemType::TabBar(
+                TabBarItem::None
+                | TabBarItem::LeftStatus
+                | TabBarItem::RightStatus
+                | TabBarItem::NewTabButton,
+            ) => Mux::get()
+                .get_window(self.mux_window_id)
+                .map(|window| window.len()),
+            UIItemType::TabBar(TabBarItem::WindowButton(_))
+            | UIItemType::CloseTab(_)
+            | UIItemType::AboveScrollThumb
+            | UIItemType::BelowScrollThumb
+            | UIItemType::ScrollThumb
+            | UIItemType::Split(_)
+            | UIItemType::PaneDragHandle(_) => None,
+        }
+    }
+
+    fn tab_bar_drop_bounds(&self) -> Option<RectF> {
+        if !self.show_tab_bar {
+            return None;
+        }
+        let height = self.tab_bar_pixel_height().ok()?;
+        let border = self.get_os_border();
+        let y = if self.config.tab_bar_at_bottom {
+            (self.dimensions.pixel_height as f32 - height - border.bottom.get() as f32).max(0.0)
+        } else {
+            border.top.get() as f32
+        };
+        Some(euclid::rect(
+            0.0,
+            y,
+            self.dimensions.pixel_width as f32,
+            height,
+        ))
+    }
+
+    fn point_in_rect(point: Point, rect: RectF) -> bool {
+        point.x as f32 >= rect.min_x()
+            && point.x as f32 <= rect.max_x()
+            && point.y as f32 >= rect.min_y()
+            && point.y as f32 <= rect.max_y()
+    }
+
+    fn drop_preview_at(
+        &self,
+        source: DragDropSource,
+        point: Point,
+    ) -> Option<super::DragDropPreview> {
+        let source_tab_id = source.tab_id();
+        if let Some(tab_bar_bounds) = self.tab_bar_drop_bounds() {
+            if Self::point_in_rect(point, tab_bar_bounds) {
+                let destination_index = self.tab_drop_index(point).or_else(|| {
+                    Mux::get()
+                        .get_window(self.mux_window_id)
+                        .map(|window| window.len())
+                })?;
+                let marker_x = self
+                    .ui_items
+                    .iter()
+                    .filter_map(|item| match item.item_type {
+                        UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. })
+                            if tab_idx == destination_index =>
+                        {
+                            Some(item.x as f32)
+                        }
+                        _ => None,
+                    })
+                    .next()
+                    .or_else(|| {
+                        self.ui_items
+                            .iter()
+                            .filter_map(|item| match item.item_type {
+                                UIItemType::TabBar(TabBarItem::Tab { .. }) => {
+                                    Some((item.x + item.width) as f32)
+                                }
+                                _ => None,
+                            })
+                            .max_by(f32::total_cmp)
+                    })
+                    .unwrap_or(tab_bar_bounds.min_x());
+                let marker_x = marker_x.clamp(
+                    tab_bar_bounds.min_x(),
+                    (tab_bar_bounds.max_x() - TAB_BAR_DROP_MARKER_WIDTH_PIXELS).max(0.0),
+                );
+                return Some(super::DragDropPreview {
+                    action: super::DragDropAction::Merge { destination_index },
+                    rect: euclid::rect(
+                        marker_x,
+                        tab_bar_bounds.min_y(),
+                        TAB_BAR_DROP_MARKER_WIDTH_PIXELS,
+                        tab_bar_bounds.height(),
+                    ),
+                });
+            }
+        }
+
+        let mux = Mux::get();
+        let source_is_in_destination_window =
+            mux.window_containing_tab(source_tab_id) == Some(self.mux_window_id);
+        let source_can_split = match source {
+            DragDropSource::Tab(tab_id) => mux
+                .get_tab(tab_id)
+                .map(|tab| tab.iter_panes_ignoring_zoom().len() == 1)
+                .unwrap_or(false),
+            DragDropSource::Pane { .. } => true,
+        };
+        let destination_tab = mux.get_active_tab_for_window(self.mux_window_id)?;
+        if destination_tab.tab_id() == source_tab_id {
+            return None;
+        }
+        let destination_index = mux
+            .get_window(self.mux_window_id)
+            .map(|window| window.len())?;
+
+        for positioned in destination_tab.iter_panes() {
+            let bounds = self.pane_drag_bounds(&positioned);
+            if bounds.width() <= 0.0
+                || bounds.height() <= 0.0
+                || !Self::point_in_rect(point, bounds)
+            {
+                continue;
+            }
+
+            if source_can_split {
+                let x_fraction = (point.x as f32 - bounds.min_x()) / bounds.width();
+                let y_fraction = (point.y as f32 - bounds.min_y()) / bounds.height();
+                let (edge_distance, direction, target_is_second) = {
+                    let mut candidate = (x_fraction, SplitDirection::Horizontal, false);
+                    if 1.0 - x_fraction < candidate.0 {
+                        candidate = (1.0 - x_fraction, SplitDirection::Horizontal, true);
+                    }
+                    if y_fraction < candidate.0 {
+                        candidate = (y_fraction, SplitDirection::Vertical, false);
+                    }
+                    if 1.0 - y_fraction < candidate.0 {
+                        candidate = (1.0 - y_fraction, SplitDirection::Vertical, true);
+                    }
+                    candidate
+                };
+
+                if edge_distance <= DROP_EDGE_FRACTION {
+                    let request = SplitRequest {
+                        direction,
+                        target_is_second,
+                        top_level: false,
+                        size: SplitSize::Percent(DROP_SPLIT_PERCENT),
+                    };
+                    let split_is_valid = destination_tab.get_zoomed_pane().is_none()
+                        && destination_tab
+                            .compute_split_size(positioned.index, request)
+                            .map(|size| {
+                                size.first.rows > 0
+                                    && size.first.cols > 0
+                                    && size.second.rows > 0
+                                    && size.second.cols > 0
+                            })
+                            .unwrap_or(false);
+                    if split_is_valid {
+                        let mut preview = bounds;
+                        match (direction, target_is_second) {
+                            (SplitDirection::Horizontal, false) => preview.size.width /= 2.0,
+                            (SplitDirection::Horizontal, true) => {
+                                preview.origin.x += preview.size.width / 2.0;
+                                preview.size.width /= 2.0;
+                            }
+                            (SplitDirection::Vertical, false) => preview.size.height /= 2.0,
+                            (SplitDirection::Vertical, true) => {
+                                preview.origin.y += preview.size.height / 2.0;
+                                preview.size.height /= 2.0;
+                            }
+                        }
+                        return Some(super::DragDropPreview {
+                            action: super::DragDropAction::Split {
+                                target_pane_id: positioned.pane.pane_id(),
+                                request,
+                            },
+                            rect: preview,
+                        });
+                    }
+                }
+            }
+
+            return match source {
+                DragDropSource::Pane { .. } => None,
+                DragDropSource::Tab(_) if source_is_in_destination_window => None,
+                DragDropSource::Tab(_) => Some(super::DragDropPreview {
+                    action: super::DragDropAction::Merge { destination_index },
+                    rect: bounds,
+                }),
+            };
+        }
+        None
+    }
+
+    fn update_drop_preview(&mut self, source: DragDropSource, point: Point) {
+        let preview = self.drop_preview_at(source, point);
+        if self.drag_drop_preview != preview {
+            self.drag_drop_preview = preview;
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+    }
+
+    fn clear_drag_drop_preview(&mut self) {
+        if self.drag_drop_preview.take().is_some() {
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+    }
+
+    fn detach_tab_to_new_window(tab_id: mux::tab::TabId, point: ScreenPoint, grab_offset: Point) {
+        let position = config::GuiPosition {
+            x: config::Dimension::Pixels((point.x - grab_offset.x) as f32),
+            y: config::Dimension::Pixels((point.y - grab_offset.y) as f32),
+            origin: config::GeometryOrigin::ScreenCoordinateSystem,
+        };
+        if let Err(err) = Mux::get().move_tab_to_new_window(tab_id, Some(position)) {
+            log::error!(
+                "detaching dragged tab {tab_id} into a new window at ({}, {}): {err:#}",
+                point.x,
+                point.y
+            );
+        }
     }
 
     fn drag_split(
@@ -382,6 +1208,9 @@ impl super::TermWindow {
             UIItemType::CloseTab(idx) => {
                 self.mouse_event_close_tab(idx, event, context);
             }
+            UIItemType::PaneDragHandle(pane_id) => {
+                self.mouse_event_pane_drag_handle(pane_id, item, event, context);
+            }
         }
     }
 
@@ -462,7 +1291,51 @@ impl super::TermWindow {
         match event.kind {
             WMEK::Press(MousePress::Left) => match item {
                 TabBarItem::Tab { tab_idx, .. } => {
-                    self.activate_tab(tab_idx as isize).ok();
+                    if self.activate_tab(tab_idx as isize).is_ok() {
+                        let dragged_item = self.resolve_ui_item(&event);
+                        let grab_offset = dragged_item
+                            .as_ref()
+                            .map(|item| {
+                                Point::new(
+                                    event.coords.x.saturating_sub(item.x as isize),
+                                    event.coords.y.saturating_sub(item.y as isize),
+                                )
+                            })
+                            .unwrap_or_else(|| Point::new(0, 0));
+                        let dragged_size = dragged_item
+                            .map(|item| Size::new(item.width as isize, item.height as isize))
+                            .unwrap_or_else(|| Size::new(0, 0));
+                        let tab_and_target =
+                            Mux::get()
+                                .get_window(self.mux_window_id)
+                                .and_then(|window| {
+                                    let tab_id = window.get_by_idx(tab_idx)?.tab_id();
+                                    let target_tab_id = window
+                                        .get_last_active_idx()
+                                        .and_then(|idx| window.get_by_idx(idx))
+                                        .map(|tab| tab.tab_id())
+                                        .filter(|target_id| *target_id != tab_id)
+                                        .or_else(|| {
+                                            window
+                                                .iter()
+                                                .find(|tab| tab.tab_id() != tab_id)
+                                                .map(|tab| tab.tab_id())
+                                        });
+                                    Some((tab_id, target_tab_id))
+                                });
+                        if let Some((tab_id, same_window_target_tab_id)) = tab_and_target {
+                            self.tab_drag.replace(TabDragState {
+                                tab_id,
+                                start_event: event.clone(),
+                                grab_offset,
+                                dragged_size,
+                                current_coords: event.coords,
+                                preview_window: None,
+                                same_window_target_tab_id,
+                                started: false,
+                            });
+                        }
+                    }
                 }
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Left);

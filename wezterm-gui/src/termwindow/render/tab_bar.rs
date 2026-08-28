@@ -6,6 +6,11 @@ use mux::renderable::RenderableDimensions;
 use wezterm_term::color::ColorAttribute;
 use window::color::LinearRgba;
 
+const DRAG_GHOST_ALPHA: f32 = 0.55;
+const DROP_PREVIEW_ALPHA: f32 = 0.28;
+const DROP_BORDER_ALPHA: f32 = 0.9;
+const DROP_BORDER_WIDTH_PIXELS: f32 = 3.0;
+
 impl crate::TermWindow {
     pub fn paint_tab_bar(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
         if self.config.use_fancy_tab_bar {
@@ -96,6 +101,58 @@ impl crate::TermWindow {
             },
             layers,
         )?;
+
+        Ok(())
+    }
+
+    pub fn paint_drag_effects(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        let color = self.palette().selection_bg.to_linear();
+
+        if let Some(preview) = self.drag_drop_preview {
+            self.filled_rectangle(layers, 2, preview.rect, color.mul_alpha(DROP_PREVIEW_ALPHA))?;
+
+            let rect = preview.rect;
+            let border = DROP_BORDER_WIDTH_PIXELS
+                .min(rect.width() / 2.0)
+                .min(rect.height() / 2.0);
+            let border_color = color.mul_alpha(DROP_BORDER_ALPHA);
+            for edge in [
+                euclid::rect(rect.min_x(), rect.min_y(), rect.width(), border),
+                euclid::rect(rect.min_x(), rect.max_y() - border, rect.width(), border),
+                euclid::rect(rect.min_x(), rect.min_y(), border, rect.height()),
+                euclid::rect(rect.max_x() - border, rect.min_y(), border, rect.height()),
+            ] {
+                self.filled_rectangle(layers, 2, edge, border_color)?;
+            }
+        }
+
+        let drag_geometry = self
+            .tab_drag
+            .as_ref()
+            .filter(|drag| drag.started)
+            .map(|drag| (drag.dragged_size, drag.current_coords, drag.grab_offset))
+            .or_else(|| {
+                self.pane_drag
+                    .as_ref()
+                    .filter(|drag| drag.started)
+                    .map(|drag| (drag.dragged_size, drag.current_coords, drag.grab_offset))
+            });
+        if let Some((dragged_size, current_coords, grab_offset)) = drag_geometry {
+            let width = dragged_size.width.max(0) as f32;
+            let height = dragged_size.height.max(0) as f32;
+            if width > 0.0 && height > 0.0 {
+                let ghost = euclid::rect(
+                    (current_coords.x - grab_offset.x) as f32,
+                    (current_coords.y - grab_offset.y) as f32,
+                    width,
+                    height,
+                );
+                self.filled_rectangle(layers, 2, ghost, color.mul_alpha(DRAG_GHOST_ALPHA))?;
+            }
+        }
 
         Ok(())
     }
