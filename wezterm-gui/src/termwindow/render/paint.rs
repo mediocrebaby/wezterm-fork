@@ -265,9 +265,15 @@ impl crate::TermWindow {
             }
         }
 
+        self.paint_pane_drag_handles(&mut layers)
+            .context("paint_pane_drag_handles")?;
+
         if self.show_tab_bar {
             self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;
         }
+
+        self.paint_drag_effects(&mut layers)
+            .context("paint_drag_effects")?;
 
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;

@@ -9,7 +9,7 @@ use crate::os::x11::connection::XConnection;
 use crate::os::x11::window::XWindow;
 use crate::screen::Screens;
 use crate::{
-    Appearance, Clipboard, MouseCursor, Rect, RequestedWindowGeometry, ResizeIncrement,
+    Appearance, Clipboard, MouseCursor, Point, Rect, RequestedWindowGeometry, ResizeIncrement,
     ScreenPoint, WindowEvent, WindowOps,
 };
 use async_trait::async_trait;
@@ -118,6 +118,14 @@ impl Connection {
 }
 
 impl ConnectionOps for Connection {
+    fn supports_cross_window_tab_drag(&self) -> bool {
+        match self {
+            Self::X11(x) => x.supports_cross_window_tab_drag(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(_) => false,
+        }
+    }
+
     fn name(&self) -> String {
         match self {
             Self::X11(x) => x.name(),
@@ -164,6 +172,14 @@ impl ConnectionOps for Connection {
             Self::X11(x) => x.beep(),
             #[cfg(feature = "wayland")]
             Self::Wayland(w) => w.beep(),
+        }
+    }
+
+    fn window_at_screen_point(&self, coords: ScreenPoint) -> Option<(Window, Point)> {
+        match self {
+            Self::X11(x) => x.window_at_screen_point(coords),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(_) => None,
         }
     }
 

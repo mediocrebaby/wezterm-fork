@@ -72,10 +72,10 @@ pub mod background;
 pub mod box_model;
 pub mod charselect;
 pub mod clipboard;
+mod cursor_spring;
 pub mod keyevent;
 pub mod modal;
 mod mouseevent;
-mod cursor_spring;
 pub mod palette;
 pub mod paneselect;
 mod prevcursor;
@@ -161,6 +161,7 @@ pub enum UIItemType {
     ScrollThumb,
     BelowScrollThumb,
     Split(PositionedSplit),
+    PaneDragHandle(PaneId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,6 +180,62 @@ impl UIItem {
             && y >= self.y as isize
             && y <= (self.y + self.height) as isize
     }
+}
+
+#[derive(Clone, Debug)]
+struct TabDragState {
+    tab_id: TabId,
+    start_event: MouseEvent,
+    grab_offset: Point,
+    dragged_size: Size,
+    current_coords: Point,
+    preview_window: Option<Window>,
+    same_window_target_tab_id: Option<TabId>,
+    started: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PaneDragState {
+    pane_id: PaneId,
+    source_tab_id: TabId,
+    start_event: MouseEvent,
+    grab_offset: Point,
+    dragged_size: Size,
+    current_coords: Point,
+    preview_window: Option<Window>,
+    same_window_target_tab_id: Option<TabId>,
+    started: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragDropSource {
+    Tab(TabId),
+    Pane { pane_id: PaneId, tab_id: TabId },
+}
+
+impl DragDropSource {
+    fn tab_id(self) -> TabId {
+        match self {
+            Self::Tab(tab_id) | Self::Pane { tab_id, .. } => tab_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DragDropAction {
+    Merge {
+        destination_index: usize,
+    },
+    Split {
+        target_pane_id: PaneId,
+        request: SplitRequest,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DragDropPreview {
+    action: DragDropAction,
+    rect: RectF,
 }
 
 #[derive(Clone, Default)]
@@ -449,6 +506,9 @@ pub struct TermWindow {
 
     ui_items: Vec<UIItem>,
     dragging: Option<(UIItem, MouseEvent)>,
+    tab_drag: Option<TabDragState>,
+    pane_drag: Option<PaneDragState>,
+    drag_drop_preview: Option<DragDropPreview>,
 
     modal: RefCell<Option<Rc<dyn Modal>>>,
 
@@ -798,6 +858,9 @@ impl TermWindow {
             semantic_zones: HashMap::new(),
             ui_items: vec![],
             dragging: None,
+            tab_drag: None,
+            pane_drag: None,
+            drag_drop_preview: None,
             last_ui_item: None,
             is_click_to_focus_window: false,
             key_table_state: KeyTableState::default(),

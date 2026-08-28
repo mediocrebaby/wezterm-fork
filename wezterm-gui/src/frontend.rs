@@ -339,6 +339,18 @@ impl GuiFrontEnd {
         windows
     }
 
+    pub fn gui_window_at_screen_point(&self, point: ScreenPoint) -> Option<(GuiWin, Point)> {
+        let (window, client_point) = self.connection.window_at_screen_point(point)?;
+        let mux_window_id = *self.known_windows.borrow().get(&window)?;
+        Some((
+            GuiWin {
+                mux_window_id,
+                window,
+            },
+            client_point,
+        ))
+    }
+
     pub fn reconcile_workspace(&self) -> Future<()> {
         let mut promise = Promise::new();
         let mux = Mux::get();
