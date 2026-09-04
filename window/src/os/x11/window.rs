@@ -1335,6 +1335,237 @@ impl XWindowInner {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct XWindow(xcb::x::Window);
 
+const DIALOG_ACTIVATION_TIMEOUT_MS: u64 = 5_000;
+const NET_ACTIVE_WINDOW: &str = "_NET_ACTIVE_WINDOW";
+const NET_WM_PID: &str = "_NET_WM_PID";
+const NET_MOVERESIZE_WINDOW: &str = "_NET_MOVERESIZE_WINDOW";
+const EWMH_MOVERESIZE_X: u32 = 1 << 8;
+const EWMH_MOVERESIZE_Y: u32 = 1 << 9;
+const EWMH_SOURCE_APPLICATION: u32 = 1 << 12;
+
+fn intern_atom(conn: &xcb::Connection, name: &str) -> anyhow::Result<Atom> {
+    let cookie = conn.send_request(&xcb::x::InternAtom {
+        only_if_exists: true,
+        name: name.as_bytes(),
+    });
+    Ok(conn
+        .wait_for_reply(cookie)
+        .with_context(|| format!("interning X11 atom {name}"))?
+        .atom())
+}
+
+fn active_window_for_process(
+    conn: &xcb::Connection,
+    root: xcb::x::Window,
+    active_window_atom: Atom,
+    wm_pid_atom: Atom,
+    process_id: u32,
+) -> anyhow::Result<Option<xcb::x::Window>> {
+    let active_window_reply = conn
+        .wait_for_reply(conn.send_request(&xcb::x::GetProperty {
+            delete: false,
+            window: root,
+            property: active_window_atom,
+            r#type: xcb::x::ATOM_WINDOW,
+            long_offset: 0,
+            long_length: 1,
+        }))
+        .context("reading the active X11 window for native dialog placement")?;
+    let Some(active_window) = active_window_reply
+        .value::<xcb::x::Window>()
+        .first()
+        .copied()
+    else {
+        return Ok(None);
+    };
+
+    let pid_reply = conn
+        .wait_for_reply(conn.send_request(&xcb::x::GetProperty {
+            delete: false,
+            window: active_window,
+            property: wm_pid_atom,
+            r#type: xcb::x::ATOM_CARDINAL,
+            long_offset: 0,
+            long_length: 1,
+        }))
+        .with_context(|| {
+            format!(
+                "reading {NET_WM_PID} from active X11 window {:#x}",
+                active_window.resource_id()
+            )
+        })?;
+
+    Ok(pid_reply
+        .value::<u32>()
+        .first()
+        .is_some_and(|pid| *pid == process_id)
+        .then_some(active_window))
+}
+
+fn wait_for_process_window(
+    conn: &xcb::Connection,
+    root: xcb::x::Window,
+    active_window_atom: Atom,
+    wm_pid_atom: Atom,
+    process_id: u32,
+) -> anyhow::Result<xcb::x::Window> {
+    let select_cookie = conn.send_request_checked(&xcb::x::ChangeWindowAttributes {
+        window: root,
+        value_list: &[xcb::x::Cw::EventMask(xcb::x::EventMask::PROPERTY_CHANGE)],
+    });
+    conn.check_request(select_cookie)
+        .context("subscribing to X11 active-window changes for dialog placement")?;
+    conn.flush()
+        .context("flushing the X11 active-window subscription")?;
+
+    if let Some(window) =
+        active_window_for_process(conn, root, active_window_atom, wm_pid_atom, process_id)?
+    {
+        return Ok(window);
+    }
+
+    use std::os::fd::AsRawFd;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(DIALOG_ACTIVATION_TIMEOUT_MS);
+    loop {
+        while let Some(event) = conn
+            .poll_for_event()
+            .context("reading X11 events while waiting for the native dialog")?
+        {
+            let is_active_window_change = matches!(
+                event,
+                xcb::Event::X(xcb::x::Event::PropertyNotify(ref event))
+                    if event.window() == root && event.atom() == active_window_atom
+            );
+            if is_active_window_change {
+                if let Some(window) = active_window_for_process(
+                    conn,
+                    root,
+                    active_window_atom,
+                    wm_pid_atom,
+                    process_id,
+                )? {
+                    return Ok(window);
+                }
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!(
+                "X11 dialog process {process_id} was not activated within {DIALOG_ACTIVATION_TIMEOUT_MS}ms"
+            ));
+        }
+        let poll_timeout = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: conn.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let poll_result = unsafe { libc::poll(&mut descriptor, 1, poll_timeout) };
+        if poll_result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(anyhow!(
+                "waiting for X11 dialog process {process_id} activation failed: {error}"
+            ));
+        }
+        if poll_result == 0 {
+            return Err(anyhow!(
+                "X11 dialog process {process_id} was not activated within {DIALOG_ACTIVATION_TIMEOUT_MS}ms"
+            ));
+        }
+    }
+}
+
+fn center_process_window(parent_window: xcb::x::Window, process_id: u32) -> anyhow::Result<()> {
+    let (conn, screen_number) = xcb::Connection::connect(None)
+        .context("connecting to X11 to center a native child dialog")?;
+    let root = conn
+        .get_setup()
+        .roots()
+        .nth(screen_number as usize)
+        .ok_or_else(|| anyhow!("X11 screen {screen_number} is unavailable"))?
+        .root();
+    let active_window_atom = intern_atom(&conn, NET_ACTIVE_WINDOW)?;
+    let wm_pid_atom = intern_atom(&conn, NET_WM_PID)?;
+    let moveresize_atom = intern_atom(&conn, NET_MOVERESIZE_WINDOW)?;
+    let dialog_window =
+        wait_for_process_window(&conn, root, active_window_atom, wm_pid_atom, process_id)?;
+
+    let parent_geometry = conn
+        .wait_for_reply(conn.send_request(&xcb::x::GetGeometry {
+            drawable: xcb::x::Drawable::Window(parent_window),
+        }))
+        .with_context(|| {
+            format!(
+                "reading geometry for parent X11 window {:#x}",
+                parent_window.resource_id()
+            )
+        })?;
+    let parent_position = conn
+        .wait_for_reply(conn.send_request(&xcb::x::TranslateCoordinates {
+            src_window: parent_window,
+            dst_window: root,
+            src_x: 0,
+            src_y: 0,
+        }))
+        .with_context(|| {
+            format!(
+                "translating parent X11 window {:#x} to root coordinates",
+                parent_window.resource_id()
+            )
+        })?;
+    let dialog_geometry = conn
+        .wait_for_reply(conn.send_request(&xcb::x::GetGeometry {
+            drawable: xcb::x::Drawable::Window(dialog_window),
+        }))
+        .with_context(|| {
+            format!(
+                "reading geometry for dialog X11 window {:#x}",
+                dialog_window.resource_id()
+            )
+        })?;
+
+    let centered_x = i32::from(parent_position.dst_x())
+        + (i32::from(parent_geometry.width()) - i32::from(dialog_geometry.width())) / 2;
+    let centered_y = i32::from(parent_position.dst_y())
+        + (i32::from(parent_geometry.height()) - i32::from(dialog_geometry.height())) / 2;
+    let position_flags = xcb::x::Gravity::Static as u32
+        | EWMH_MOVERESIZE_X
+        | EWMH_MOVERESIZE_Y
+        | EWMH_SOURCE_APPLICATION;
+    let event = xcb::x::ClientMessageEvent::new(
+        dialog_window,
+        moveresize_atom,
+        xcb::x::ClientMessageData::Data32([
+            position_flags,
+            centered_x as u32,
+            centered_y as u32,
+            u32::from(dialog_geometry.width()),
+            u32::from(dialog_geometry.height()),
+        ]),
+    );
+    let move_cookie = conn.send_request_checked(&xcb::x::SendEvent {
+        propagate: true,
+        destination: xcb::x::SendEventDest::Window(root),
+        event_mask: xcb::x::EventMask::SUBSTRUCTURE_REDIRECT
+            | xcb::x::EventMask::SUBSTRUCTURE_NOTIFY,
+        event: &event,
+    });
+    conn.check_request(move_cookie).with_context(|| {
+        format!(
+            "moving dialog window {:#x} to {centered_x},{centered_y}",
+            dialog_window.resource_id()
+        )
+    })?;
+    conn.flush().context("flushing centered dialog position")?;
+
+    Ok(())
+}
+
 impl PartialOrd for XWindow {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.0.resource_id().partial_cmp(&other.0.resource_id())
@@ -2085,6 +2316,18 @@ impl WindowOps for XWindow {
         XConnection::with_window_inner(self.0, move |inner| {
             inner.set_window_position(coords);
             Ok(())
+        });
+    }
+
+    fn center_child_process_window(&self, process_id: u32) {
+        let parent_window = self.0;
+        let _ = std::thread::spawn(move || {
+            if let Err(err) = center_process_window(parent_window, process_id) {
+                log::warn!(
+                    "Unable to center native dialog process {process_id} over X11 window {:#x}: {err:#}",
+                    parent_window.resource_id()
+                );
+            }
         });
     }
 

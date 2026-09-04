@@ -22,6 +22,10 @@ usually the best available version.
 As features stabilize some brief notes about them will accumulate here.
 
 #### Changed
+* Close confirmation prompts are now native system dialogs and explicitly warn
+  when closing a pane, tab or window will terminate running processes. Active
+  SSH-domain and serial panes also prompt when their remote process tree cannot
+  be inspected locally.
 * DECRQCRA is now disabled by default to prevent silent screen scraping.
   Set `enable_checksum_rectangular_area = true` to re-enable it.
   Thanks to @jquast! #7701
@@ -2512,5 +2516,4 @@ font_hinting = "Full" # None, Vertical, VerticalSubpixel, Full
 * `wezterm imgcat /some/image.png` to display images inline in the terminal using the iTerm2 image protocol
 * IME support on macOS and Windows systems
 * Automatic fallback to software rendering if no GPU is available (eg: certain types of remote desktop sessions)
-
 

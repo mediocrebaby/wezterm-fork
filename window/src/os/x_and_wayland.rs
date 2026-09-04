@@ -386,6 +386,14 @@ impl WindowOps for Window {
         }
     }
 
+    fn center_child_process_window(&self, process_id: u32) {
+        match self {
+            Self::X11(x) => x.center_child_process_window(process_id),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(_) => {}
+        }
+    }
+
     fn set_text_cursor_position(&self, cursor: Rect) {
         match self {
             Self::X11(x) => x.set_text_cursor_position(cursor),
