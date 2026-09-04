@@ -308,6 +308,10 @@ pub trait WindowOps {
     /// windows to move themselves (not Wayland).
     fn set_window_position(&self, _coords: ScreenPoint) {}
 
+    /// Center a newly-created native dialog owned by another process over
+    /// this window when the windowing system permits explicit positioning.
+    fn center_child_process_window(&self, _process_id: u32) {}
+
     /// inform the windowing system of the current textual
     /// cursor input location.  This is used primarily for
     /// the platform specific input method editor

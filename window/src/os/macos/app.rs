@@ -14,6 +14,8 @@ use objc::runtime::{Class, Object, Sel, BOOL, NO, YES};
 use objc::*;
 
 const CLS_NAME: &str = "WezTermAppDelegate";
+const TERMINATE_INFO_TEXT: &str =
+    "Closing all panes may terminate processes that are still running.";
 
 extern "C" fn application_should_terminate(
     _self: &mut Object,
@@ -28,7 +30,7 @@ extern "C" fn application_should_terminate(
                 let alert: id = msg_send![class!(NSAlert), alloc];
                 let alert: id = msg_send![alert, init];
                 let message_text = nsstring("Terminate WezTerm?");
-                let info_text = nsstring("Detach and close all panes and terminate wezterm?");
+                let info_text = nsstring(TERMINATE_INFO_TEXT);
                 let cancel = nsstring("Cancel");
                 let ok = nsstring("Ok");
 

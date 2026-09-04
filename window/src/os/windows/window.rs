@@ -746,12 +746,10 @@ impl HasDisplayHandle for Window {
 
 impl HasWindowHandle for Window {
     fn window_handle(&self) -> Result<WindowHandle, HandleError> {
-        let conn = Connection::get().expect("raw_window_handle only callable on main thread");
-        let handle = conn.get_window(self.0).expect("window handle invalid!?");
-
-        let inner = handle.borrow();
-        let handle = inner.window_handle()?;
-        unsafe { Ok(WindowHandle::borrow_raw(handle.as_raw())) }
+        let mut handle =
+            Win32WindowHandle::new(NonZeroIsize::new(self.0 .0 as _).expect("non-zero"));
+        handle.hinstance = NonZeroIsize::new(unsafe { GetModuleHandleW(null()) } as _);
+        unsafe { Ok(WindowHandle::borrow_raw(RawWindowHandle::Win32(handle))) }
     }
 }
 
@@ -1450,9 +1448,7 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
                 };
                 // DWMWA_CAPTION_COLOR wants a COLORREF (0x00BBGGRR).
                 let colorref: DWORD = match caption {
-                    Some((r, g, b, _)) => {
-                        (r as DWORD) | (g as DWORD) << 8 | (b as DWORD) << 16
-                    }
+                    Some((r, g, b, _)) => (r as DWORD) | (g as DWORD) << 8 | (b as DWORD) << 16,
                     None => DWMWA_COLOR_DEFAULT,
                 };
                 DwmSetWindowAttribute(

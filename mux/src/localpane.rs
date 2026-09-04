@@ -36,6 +36,7 @@ use wezterm_term::{
 };
 
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
+const FIGTERM_PROCESS_NAME_SUFFIX: &str = " (figterm)";
 
 #[derive(Debug)]
 enum ProcessState {
@@ -56,6 +57,25 @@ struct CachedProcInfo {
     root: LocalProcessInfo,
     updated: Instant,
     foreground: LocalProcessInfo,
+}
+
+fn process_tree_is_stateful(proc_list: &LocalProcessInfo, stateless_names: &[String]) -> bool {
+    // Fig uses `figterm`, a pseudo terminal for a lot of functionality, between
+    // the shell and terminal. It names the executable `<shell> (figterm)`, so
+    // strip that suffix before comparing it with the stateless-process list.
+    let process_names = proc_list
+        .flatten_to_exe_names()
+        .into_iter()
+        .map(
+            |name| match name.strip_suffix(FIGTERM_PROCESS_NAME_SUFFIX) {
+                Some(name) => name.into(),
+                None => name,
+            },
+        )
+        .collect::<HashSet<_>>();
+
+    let stateless_names = stateless_names.iter().cloned().collect::<HashSet<_>>();
+    !process_names.is_subset(&stateless_names)
 }
 
 /// This is a bit horrible; it can take 700us to tcgetpgrp, so if we have
@@ -581,36 +601,11 @@ impl Pane for LocalPane {
                 }
             });
 
-            fn default_stateful_check(proc_list: &LocalProcessInfo) -> bool {
-                // Fig uses `figterm` a pseudo terminal for a lot of functionality, it runs between
-                // the shell and terminal. Unfortunately it is typically named `<shell> (figterm)`,
-                // which prevents the statuful check from passing. This strips the suffix from the
-                // process name to allow the check to pass.
-                let names = proc_list
-                    .flatten_to_exe_names()
-                    .into_iter()
-                    .map(|s| match s.strip_suffix(" (figterm)") {
-                        Some(s) => s.into(),
-                        None => s,
-                    })
-                    .collect::<HashSet<_>>();
-
-                let skip = configuration()
-                    .skip_close_confirmation_for_processes_named
-                    .iter()
-                    .cloned()
-                    .collect::<HashSet<_>>();
-
-                if !names.is_subset(&skip) {
-                    // There are other processes running than are listed,
-                    // so we consider this to be stateful
-                    return true;
-                }
-                false
-            }
-
             let is_stateful = match hook_result {
-                Ok(None) => default_stateful_check(&info.root),
+                Ok(None) => process_tree_is_stateful(
+                    &info.root,
+                    &configuration().skip_close_confirmation_for_processes_named,
+                ),
                 Ok(Some(s)) => s,
                 Err(err) => {
                     log::error!(
@@ -618,23 +613,19 @@ impl Pane for LocalPane {
                          hook: {:#}, falling back to default behavior",
                         err
                     );
-                    default_stateful_check(&info.root)
+                    process_tree_is_stateful(
+                        &info.root,
+                        &configuration().skip_close_confirmation_for_processes_named,
+                    )
                 }
             };
 
             !is_stateful
         } else {
-            #[cfg(unix)]
-            {
-                // If the process is dead but exit_behavior is holding the
-                // window, we don't need to prompt to confirm closing.
-                // That is detectable as no longer having a process group leader.
-                if self.pty.lock().process_group_leader().is_none() {
-                    return true;
-                }
-            }
-
-            false
+            // Remote and serial panes don't have a local process tree to
+            // inspect. Distinguish a live, uninspectable child from a child
+            // that has exited but is being held open by exit_behavior.
+            self.child_process_has_exited()
         }
     }
 
@@ -985,6 +976,13 @@ fn split_child(
 }
 
 impl LocalPane {
+    fn child_process_has_exited(&self) -> bool {
+        // Poll the waiter so that a just-finished child advances from Running
+        // before we classify its lifecycle state.
+        self.is_dead();
+        !matches!(&*self.process.lock(), ProcessState::Running { .. })
+    }
+
     pub fn new(
         pane_id: PaneId,
         mut terminal: Terminal,
@@ -1141,5 +1139,154 @@ impl Drop for LocalPane {
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
             let _ = signaller.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{process_tree_is_stateful, LocalPane, ProcessState};
+    use crate::pane::{CloseReason, Pane};
+    use parking_lot::Mutex;
+    use portable_pty::{ChildKiller, MasterPty, PtySize};
+    use procinfo::{LocalProcessInfo, LocalProcessStatus};
+    use smol::channel::bounded;
+    use std::collections::HashMap;
+    use std::io::{Result as IoResult, Write};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use wezterm_term::{Terminal, TerminalSize};
+
+    #[derive(Debug)]
+    struct RemoteLikePty;
+
+    impl MasterPty for RemoteLikePty {
+        fn resize(&self, _size: PtySize) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_size(&self) -> anyhow::Result<PtySize> {
+            Ok(PtySize::default())
+        }
+
+        fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
+            Ok(Box::new(std::io::empty()))
+        }
+
+        fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
+            Ok(Box::new(std::io::sink()))
+        }
+
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestChildKiller;
+
+    impl ChildKiller for TestChildKiller {
+        fn kill(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(Self)
+        }
+    }
+
+    fn process(pid: u32, executable: &str) -> LocalProcessInfo {
+        LocalProcessInfo {
+            pid,
+            ppid: 0,
+            name: executable.to_string(),
+            executable: PathBuf::from(executable),
+            argv: vec![executable.to_string()],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            #[cfg(windows)]
+            console: 1,
+            children: HashMap::new(),
+        }
+    }
+
+    fn remote_like_pane(process: ProcessState) -> LocalPane {
+        let terminal = Terminal::new(
+            TerminalSize::default(),
+            Arc::new(config::TermConfig::new()),
+            "WezTerm",
+            "test",
+            Box::new(std::io::sink()),
+        );
+        LocalPane {
+            pane_id: 1,
+            terminal: Mutex::new(terminal),
+            process: Mutex::new(process),
+            pty: Mutex::new(Box::new(RemoteLikePty)),
+            writer: Mutex::new(Box::new(std::io::sink())),
+            domain_id: 1,
+            tmux_domain: Mutex::new(None),
+            proc_list: Mutex::new(None),
+            #[cfg(unix)]
+            leader: Arc::new(Mutex::new(None)),
+            command_description: "remote test pane".to_string(),
+        }
+    }
+
+    #[test]
+    fn shell_only_process_tree_is_stateless() {
+        let shell = process(1, "bash");
+        let stateless_names = vec!["bash".to_string()];
+
+        assert!(!process_tree_is_stateful(&shell, &stateless_names));
+    }
+
+    #[test]
+    fn child_process_makes_process_tree_stateful() {
+        let mut shell = process(1, "bash");
+        shell.children.insert(2, process(2, "vim"));
+        let stateless_names = vec!["bash".to_string()];
+
+        assert!(process_tree_is_stateful(&shell, &stateless_names));
+    }
+
+    #[test]
+    fn figterm_shell_suffix_is_ignored() {
+        let shell = process(1, "bash (figterm)");
+        let stateless_names = vec!["bash".to_string()];
+
+        assert!(!process_tree_is_stateful(&shell, &stateless_names));
+    }
+
+    #[test]
+    fn running_remote_pane_without_local_process_info_requires_confirmation() {
+        let (child_waiter_tx, child_waiter) = bounded(1);
+        let pane = remote_like_pane(ProcessState::Running {
+            child_waiter,
+            pid: None,
+            signaller: Box::new(TestChildKiller),
+            killed: false,
+        });
+
+        assert!(!pane.can_close_without_prompting(CloseReason::Pane));
+        drop(child_waiter_tx);
+    }
+
+    #[test]
+    fn exited_remote_pane_held_open_does_not_require_confirmation() {
+        let pane = remote_like_pane(ProcessState::DeadPendingClose { killed: false });
+
+        assert!(pane.can_close_without_prompting(CloseReason::Pane));
     }
 }
